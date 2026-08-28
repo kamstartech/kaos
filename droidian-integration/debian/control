@@ -1,0 +1,20 @@
+Source: kaos-droidian-integration
+Section: metapackages
+Priority: optional
+Maintainer: Kaos Project <kaos@example.com>
+Build-Depends: debhelper (>= 13),
+               debhelper-compat (= 13)
+Standards-Version: 4.6.2
+
+Package: kaos-droidian-integration
+Architecture: all
+Depends: ${misc:Depends},
+         phosh-config-hwcomposer,
+         halium-wrappers
+Description: Kaos project-wide integration for Droidian
+ This package contains device-agnostic configuration files and
+ integration scripts used by the Kaos/HybridOS ROM when booting
+ Droidian in a Halium-style LXC container.  It extends the upstream
+ phosh-config-hwcomposer and halium-wrappers packages with overrides
+ required by this project's system-as-root (SAR) partition layout and
+ shared Android system image.

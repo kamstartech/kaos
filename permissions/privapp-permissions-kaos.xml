@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="com.kaos">
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+        <permission name="android.permission.MANAGE_WIFI_INTERFACES"/>
+        <permission name="android.permission.BLUETOOTH_PRIVILEGED"/>
+        <permission name="android.permission.CHANGE_CONFIGURATION"/>
+        <permission name="android.permission.SCHEDULE_EXACT_ALARM"/>
+    </privapp-permissions>
+
+    <privapp-permissions package="com.offsec.nhterm">
+        <permission name="android.permission.READ_LOGS"/>
+    </privapp-permissions>
+
+    <privapp-permissions package="com.kaos.phosh">
+        <permission name="android.permission.STATUS_BAR"/>
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+    </privapp-permissions>
+
+    <privapp-permissions package="com.android.aliceagent">
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+    </privapp-permissions>
+</permissions>

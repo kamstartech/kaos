@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify HybridOS handoff state for Kali
+After=kali-hybridos-prepare.service
+Requires=kali-hybridos-prepare.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kali-hybridos-verify
+RemainAfterExit=yes
+
+[Install]
+WantedBy=kali-hybridos.target

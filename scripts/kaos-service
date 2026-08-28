@@ -1,0 +1,1204 @@
+#!/system/bin/sh
+# Kaos Service Controller
+# Location: /system/bin/kaos-service
+# Manages: Namespace lifecycle, mounts, and status detection
+# Supports: Multi-distro via distros-lib.sh (HybridOS mode) or official Kali paths
+
+# === Load Distro Library ===
+SCRIPT_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+if [ -f "${SCRIPT_DIR}/distros-lib.sh" ]; then
+    . "${SCRIPT_DIR}/distros-lib.sh"
+elif [ -f "/system/bin/distros-lib.sh" ]; then
+    . /system/bin/distros-lib.sh
+else
+    echo "FATAL: distros-lib.sh not found"
+    exit 1
+fi
+
+# === Parse --distro flag ===
+parse_distro_flag "$@"
+resolve_distro "${_DISTRO_ARG}"
+set -- $_REMAINING_ARGS
+
+# === Configuration (resolved by distros-lib) ===
+STATUS_FILE="/data/local/.kaos_status"
+
+# === Logging (distro-aware) ===
+log() {
+    dlog "$1"
+}
+
+rootfs_ready() {
+    [ -d "$REAL_CHROOT" ] || return 1
+    [ -f "$REAL_CHROOT/etc/os-release" ] && return 0
+    [ -f "$REAL_CHROOT/bin/sh" ] && return 0
+    [ -f "$REAL_CHROOT/usr/bin/env" ] && return 0
+    return 1
+}
+
+# === Mount Operations (from nh-mounts) ===
+do_mounts() {
+    log "Starting mount operations..."
+
+    # 0. Nuclear Cleanup: Forcibly unmount everything to ensure a clean state
+    # We use -l (lazy) to handle busy filesystems safely
+    for m in system_root mnt/vendor/persist vendor/bt_firmware vendor/dsp vendor/firmware_mnt \
+             system vendor sdcard dev/dri dev/pts dev proc ""; do
+        umount -l "$CHROOT/$m" 2>/dev/null
+    done
+
+    if [ ! -d "$REAL_CHROOT" ]; then
+        log "Chroot directory NOT found at $REAL_CHROOT. Skipping mounts."
+        return 1
+    fi
+
+    # Setup mount point
+    if [ -L "$CHROOT" ]; then rm "$CHROOT"; fi
+    [ ! -d "$CHROOT" ] && mkdir -p "$CHROOT"
+
+    # 1. Base Chroot — bind mount (official NH) or distro_mount (HybridOS)
+    if ! grep -qs "$CHROOT " /proc/mounts; then
+        if [ "$DISTRO_MODE" = "hybridos" ]; then
+            distro_mount
+        else
+            runcon u:r:su:s0 mount -o bind "$REAL_CHROOT" "$CHROOT"
+        fi
+        runcon u:r:su:s0 mount -o remount,suid,exec,dev "$CHROOT"
+    fi
+
+    # 2. /dev, /proc, /sys, /run, /tmp are now mounted from INSIDE the namespace
+    #    by ns-entry.sh for proper isolation. No host bind mounts needed for these.
+
+    # Ensure user has a runtime directory with correct ownership
+    mkdir -p "$CHROOT/run/user/100000"
+    runcon u:r:su:s0 chown 100000:100000 "$CHROOT/run/user/100000"
+    runcon u:r:su:s0 chmod 700 "$CHROOT/run/user/100000"
+
+
+
+
+    # 4. Mount Android Runtime partitions & GPU
+    # Also ensure UI socket directory exists
+    runcon u:r:su:s0 mkdir -p /dev/socket
+    runcon u:r:su:s0 chmod 777 /dev/socket
+    
+    for m in system vendor sdcard dev/dri dev/socket; do
+        [ ! -d "$CHROOT/$m" ] && mkdir -p "$CHROOT/$m"
+        if ! grep -qs "$CHROOT/$m " /proc/mounts; then
+            runcon u:r:su:s0 mount -o bind "/$m" "$CHROOT/$m" 2>/dev/null
+        fi
+    done
+
+    # SailfishOS needs firmware paths bind-mounted from Android host
+    if [ -f "$REAL_CHROOT/etc/os-release" ] && grep -q 'sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null; then
+        log "SailfishOS detected — mounting firmware paths"
+        for fw in vendor/firmware_mnt vendor/dsp vendor/bt_firmware mnt/vendor/persist; do
+            if [ -d "/$fw" ]; then
+                [ ! -d "$CHROOT/$fw" ] && mkdir -p "$CHROOT/$fw"
+                if ! grep -qs "$CHROOT/$fw " /proc/mounts; then
+                    runcon u:r:su:s0 mount -o bind,ro "/$fw" "$CHROOT/$fw" 2>/dev/null && \
+                        log "  Mounted /$fw"
+                fi
+            fi
+        done
+        # system_root: SailfishOS expects /system_root with system-as-root layout
+        if [ -d "/system" ] && [ ! -d "$CHROOT/system_root" ]; then
+            mkdir -p "$CHROOT/system_root"
+        fi
+        # /system_root should mirror Android's root (/) where /system lives
+        if [ -d "$CHROOT/system_root" ] && ! grep -qs "$CHROOT/system_root " /proc/mounts; then
+            runcon u:r:su:s0 mount -o bind,ro "/" "$CHROOT/system_root" 2>/dev/null && \
+                log "  Mounted / → /system_root"
+        fi
+        # linkerconfig: droid-hal-init (Android 15) dynamic linker needs this
+        if [ -d "/linkerconfig" ]; then
+            [ ! -d "$CHROOT/linkerconfig" ] && mkdir -p "$CHROOT/linkerconfig"
+            if ! grep -qs "$CHROOT/linkerconfig " /proc/mounts; then
+                runcon u:r:su:s0 mount -o bind,ro "/linkerconfig" "$CHROOT/linkerconfig" 2>/dev/null && \
+                    log "  Mounted /linkerconfig"
+            fi
+        fi
+        # configfs: bind-mount Android's /config so usb-moded can see the USB gadget
+        # A fresh sysfs is mounted at /sys in the namespace, so /sys/kernel/config
+        # is empty sysfs — usb-moded can't find USB gadget there. Bind Android's
+        # configfs (which already has g1 set up by droid-hal-init) to the standard path.
+        if [ -d "/config/usb_gadget" ]; then
+            mkdir -p "$CHROOT/sys/kernel/config"
+            if ! grep -qs "$CHROOT/sys/kernel/config " /proc/mounts; then
+                runcon u:r:su:s0 mount -o bind "/config" "$CHROOT/sys/kernel/config" 2>/dev/null && \
+                    log "  Mounted /config → /sys/kernel/config"
+            fi
+        fi
+        # /run/droid-hal: droid-hal-startup.sh saves notify socket here
+        mkdir -p "$CHROOT/run/droid-hal"
+    fi
+
+    log "Mount operations complete."
+    return 0
+}
+
+# === Detection/Status (from nh-detect) ===
+do_detect() {
+    # Check if chroot exists either at the active mount point or the real path
+    local shell_bin="${DISTRO_SHELL:-/bin/bash}"
+    local shell_name=$(basename "$shell_bin")
+    if ([ -d "$CHROOT" ] && [ -f "$CHROOT/bin/$shell_name" ]) || ([ -d "$REAL_CHROOT" ] && [ -f "$REAL_CHROOT/bin/$shell_name" ]); then
+        runcon u:r:su:s0 setprop kaos.chroot.installed "true"
+        
+        if mount | grep -qs "$CHROOT "; then
+            runcon u:r:su:s0 setprop kaos.chroot.mounted "true"
+            runcon u:r:su:s0 setprop kaos.status "Ready"
+        else
+            runcon u:r:su:s0 setprop kaos.chroot.mounted "false"
+            runcon u:r:su:s0 setprop kaos.status "Stopped"
+        fi
+        
+        # Get version (prefer active mount)
+        VPATH="$CHROOT"
+        [ ! -f "$VPATH/etc/os-release" ] && VPATH="$REAL_CHROOT"
+        
+        if [ -f "$VPATH/etc/os-release" ]; then
+            version=$(grep "VERSION=" "$VPATH/etc/os-release" | cut -d'"' -f2)
+            runcon u:r:su:s0 setprop kaos.chroot.version "$version"
+        fi
+    else
+        runcon u:r:su:s0 setprop kaos.chroot.installed "false"
+        runcon u:r:su:s0 setprop kaos.chroot.mounted "false"
+        runcon u:r:su:s0 setprop kaos.status "Not Installed"
+    fi
+
+    # Create status file for manual inspection
+    {
+        echo "Kaos Status"
+        echo "Generated: $(date)"
+        echo "Installed: $(getprop kaos.chroot.installed)"
+        echo "Mounted: $(getprop kaos.chroot.mounted)"
+        echo "Status: $(getprop kaos.status)"
+    } > "$STATUS_FILE"
+    chmod 644 "$STATUS_FILE"
+}
+
+# === Start Namespace ===
+start_namespace() {
+    # Check if already running
+    if [ -f "$PID_FILE" ]; then
+        if kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+            log "${DISTRO_NAME} namespace already running (PID $(cat $PID_FILE))."
+            return 1
+        else
+            rm "$PID_FILE"
+        fi
+    fi
+
+    # Verify the real rootfs exists and looks usable before mounting anything.
+    if ! rootfs_ready; then
+        log "Chroot not ready at $REAL_CHROOT. Please install or repair it first."
+        return 1
+    fi
+
+    # Clean up any residual mounts from previous failures to avoid 'busy' errors
+    umount -l "$CHROOT/proc" 2>/dev/null
+    umount -l "$CHROOT/sys" 2>/dev/null
+    umount -l "$CHROOT/dev/pts" 2>/dev/null
+    umount -l "$CHROOT/dev" 2>/dev/null
+
+    # Ensure mounts are done
+    do_mounts || return 1
+
+    # Find busybox
+    BUSYBOX=$(find_busybox)
+    if [ -z "$BUSYBOX" ]; then
+        log "ERROR: busybox not found."
+        return 1
+    fi
+
+    log "Starting ${DISTRO_NAME} namespace..."
+
+    # Detect if using systemd or custom kaos-init
+    USING_SYSTEMD=0
+    case "$DISTRO_INIT" in
+        /sbin/init|/lib/systemd/systemd|/usr/lib/systemd/systemd)
+            if [ -L "$CHROOT/sbin/init" ] && readlink "$CHROOT/sbin/init" | grep -q systemd; then
+                USING_SYSTEMD=1
+            elif [ "$DISTRO_INIT" != "/sbin/init" ]; then
+                USING_SYSTEMD=1
+            fi
+            ;;
+    esac
+
+    if [ "$USING_SYSTEMD" = "1" ]; then
+        log "Configuring systemd-based init for ${DISTRO_NAME}..."
+
+        # SailfishOS uses lipstick as compositor, not phosh. Skip phosh setup entirely.
+        IS_SFOS=0
+        grep -q 'ID=sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null && IS_SFOS=1
+
+        if [ "$IS_SFOS" = "0" ]; then
+            # Create phosh.service drop-in with HybridOS environment
+            mkdir -p "$CHROOT/etc/systemd/system/phosh.service.d"
+            cat > "$CHROOT/etc/systemd/system/phosh.service.d/kaos.conf" << 'SYSEOF'
+[Unit]
+# Remove VT/tty conditions — we run in a namespace without real VTs
+ConditionPathExists=
+
+[Service]
+# HybridOS environment: headless display + libinput for touch
+Environment=WLR_BACKENDS=headless,libinput
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+Environment=WLR_HEADLESS_OUTPUTS=1
+Environment=WLR_LOG=debug
+Environment=PHOC_DEBUG=auto-maximize
+# libseat's default backend probe picks seatd (its socket is up), but seatd
+# then fails trying to open/manage a real VT (tty0) that doesn't exist in
+# this namespace -- confirmed live 2026-08-28: "Could not open tty0 to
+# update VT" / "Timeout waiting session to become active" / "failed to add
+# backend 'libinput'". systemd-logind is already running here and already
+# opens PAM sessions cleanly with no VT involved, so force libseat onto it
+# instead of letting it default to seatd.
+Environment=LIBSEAT_BACKEND=logind
+# pam_systemd only assigns a session to seat0 when it sees this hint before
+# the session opens -- without it, confirmed live 2026-08-28: the session
+# opens fine but has no seat at all ("[libseat] Backend 'logind' failed to
+# open seat: No data available" / "Unable to create seat"), same end
+# result (phoc can't create a backend) as the seatd/VT failure this replaced.
+Environment=XDG_SEAT=seat0
+# Override TTY settings — no real VTs in namespace
+TTYPath=
+TTYReset=no
+TTYVHangup=no
+TTYVTDisallocate=no
+StandardInput=null
+# Remove chvt command (no VT switching)
+ExecStartPost=
+SYSEOF
+
+            # seatd.service competes with logind (see LIBSEAT_BACKEND above)
+            # for ownership of seat0 -- mask it the same way other
+            # conflicting services are masked elsewhere in this script.
+            mkdir -p "$CHROOT/etc/systemd/system"
+            ln -sf /dev/null "$CHROOT/etc/systemd/system/seatd.service"
+
+            # Enable phosh in graphical.target for non-SailfishOS systemd distros
+            mkdir -p "$CHROOT/etc/systemd/system/graphical.target.wants"
+            ln -sf /lib/systemd/system/phosh.service "$CHROOT/etc/systemd/system/graphical.target.wants/phosh.service" 2>/dev/null
+            log "Systemd phosh.service configured with HybridOS overrides"
+        else
+            log "SailfishOS detected — skipping phosh setup (lipstick is the SFOS compositor)"
+        fi
+
+        # Tell systemd it's running in a container (prevents hardware probing issues)
+        mkdir -p "$CHROOT/etc/systemd/system.conf.d"
+        cat > "$CHROOT/etc/systemd/system.conf.d/kaos.conf" << 'SYSCONF'
+[Manager]
+DefaultEnvironment=container=kaos
+SYSCONF
+    else
+        # Create kaos-init script (Custom PID 1 - Native Wayland)
+        log "Updating kaos-init script for ${DISTRO_NAME} with Native Wayland Phosh..."
+    fi
+
+    mkdir -p "$CHROOT/usr/local/sbin"
+    cat > "$CHROOT/usr/local/sbin/kaos-init" << 'INITEOF'
+#!/bin/bash
+# Kaos Namespace Init — Native Touch via libinput
+#
+# Architecture:
+#   Android touch → Unix socket → kaos-touch-input (uinput) →
+#   /dev/input/eventN → libinput → phoc (wl_touch) → Phosh
+#
+# Key design decisions:
+#   - WLR_BACKENDS=headless,libinput: headless provides virtual display,
+#     libinput picks up the uinput touchscreen device for native touch events
+#   - seatd provides seat management required by libinput backend
+#   - udevd provides device enumeration required by libinput
+#   - WLR_LIBINPUT_NO_DEVICES=1: allows phoc to start before touch device exists
+#   - kaos-touch-input creates a uinput device with INPUT_PROP_DIRECT
+#     so libinput classifies it as a touchscreen (not pointer/mouse)
+#   - No zwlr_virtual_pointer — that protocol always produces cursor events
+#
+# Compile kaos-touch-input from kaos-input.c:
+#   gcc -o kaos-touch-input kaos-input.c -O2
+#   (no external library dependencies — pure uinput + Unix socket)
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export USER=root
+export TERM=xterm
+export XDG_RUNTIME_DIR=/run/user/0
+export XDG_SESSION_TYPE=wayland
+export WAYLAND_DISPLAY=wayland-0
+
+# Compositor backend config: headless for display, libinput for touch input
+export WLR_BACKENDS=headless,libinput
+export WLR_RENDERER=vulkan
+export LIBSEAT_BACKEND=seatd
+# Allow phoc to start even if no input devices are present yet
+export WLR_LIBINPUT_NO_DEVICES=1
+# GPU rendering: Turnip Vulkan driver via KGSL (Adreno 630)
+export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+export VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
+export LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib/aarch64-linux-gnu
+export LD_PRELOAD=/usr/local/lib/kgsl_drm_shim.so
+export GBM_BACKEND=kgsl
+export GBM_BACKENDS_PATH=/usr/local/lib/gbm
+
+# DRM Direct Mode: if flag file exists, use DRM+libinput instead of headless
+LINUX_DIRECT_MODE=0
+if [ -f /tmp/.linux_mode ]; then
+    LINUX_DIRECT_MODE=1
+    export WLR_BACKENDS=drm,libinput
+    export WLR_DRM_DEVICES=/dev/dri/card0
+    export WLR_DRM_NO_MODIFIERS=1
+    unset WLR_LIBINPUT_NO_DEVICES
+fi
+
+hostname kaos 2>/dev/null || true
+
+# 0. System Foundation
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mkdir -p /dev/shm && mount -t tmpfs tmpfs /dev/shm -o rw,nosuid,nodev,noexec,mode=1777
+mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR
+
+# 1. Permission Fixes & Resource Limits
+chmod 1777 /tmp
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+rm -f /tmp/.X*-lock /tmp/.X11-unix/X*
+rm -f $XDG_RUNTIME_DIR/wayland-*
+
+echo 1024 > /proc/sys/fs/inotify/max_user_instances 2>/dev/null
+echo 65536 > /proc/sys/fs/inotify/max_user_watches 2>/dev/null
+
+mkdir -p /etc/dconf/db
+touch /etc/dconf/db/local
+dconf update 2>/dev/null
+
+# 2. Setup Phosh path and config
+ln -sf /usr/libexec/phosh /usr/bin/phosh
+
+mkdir -p /etc/phosh
+if [ "$LINUX_DIRECT_MODE" = "1" ]; then
+    cat > /etc/phosh/phoc.ini << 'PHOCEOF'
+[core]
+xwayland=false
+
+[output:DSI-1]
+scale = 2
+PHOCEOF
+else
+    cat > /etc/phosh/phoc.ini << 'PHOCEOF'
+[core]
+xwayland=false
+
+[output:HEADLESS-1]
+mode = 1080x2340
+scale = 2
+PHOCEOF
+fi
+cp /etc/phosh/phoc.ini /usr/share/phosh/phoc.ini
+
+cat > /usr/bin/phosh-session << 'PHOSHSESSIONEOF'
+#!/bin/sh
+if [ -f /tmp/.linux_mode ]; then
+    export WLR_BACKENDS=drm,libinput
+    export WLR_DRM_DEVICES=/dev/dri/card0
+    export WLR_DRM_NO_MODIFIERS=1
+else
+    export WLR_BACKENDS=headless,libinput
+    export WLR_LIBINPUT_NO_DEVICES=1
+fi
+export WLR_RENDERER=vulkan
+export LIBSEAT_BACKEND=seatd
+export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+export VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
+export LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib/aarch64-linux-gnu
+export LD_PRELOAD=/usr/local/lib/kgsl_drm_shim.so
+export GBM_BACKEND=kgsl
+export GBM_BACKENDS_PATH=/usr/local/lib/gbm
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Phosh:GNOME
+export DISPLAY=:0
+PHOC_INI=/etc/phosh/phoc.ini
+[ -f "$PHOC_INI" ] || PHOC_INI=/usr/share/phosh/phoc.ini
+exec phoc -v -S -C "$PHOC_INI" -E "/usr/libexec/phosh -U"
+PHOSHSESSIONEOF
+chmod +x /usr/bin/phosh-session
+
+# 3. Start Core Services
+/etc/init.d/dbus start > /var/log/dbus.log 2>&1
+/etc/init.d/elogind start > /var/log/elogind.log 2>&1
+/etc/init.d/ssh start > /var/log/ssh.log 2>&1
+
+# 3a. Start seatd (required by libinput backend for device access)
+mkdir -p /run
+
+# In DRM mode, wait for SurfaceFlinger/HWC to release DRM master
+# kaos-service stops SF/HWC when persist.kaos.linux_mode=1, but there's a
+# race: the namespace may start before they release card0. We retry drmSetMaster
+# via a small test to confirm DRM master is available before starting seatd.
+if [ "$LINUX_DIRECT_MODE" = "1" ]; then
+    echo "[$(date)] DRM mode: waiting for DRM master availability..." >> /var/log/kaos-init.log
+    DRM_READY=0
+    for i in $(seq 1 30); do
+        # Try opening card0 and setting master — if it works, DRM is free
+        if python3 -c "
+import fcntl, os, struct
+fd = os.open('/dev/dri/card0', os.O_RDWR)
+try:
+    fcntl.ioctl(fd, 0x641e)  # DRM_IOCTL_SET_MASTER
+    fcntl.ioctl(fd, 0x641f)  # DRM_IOCTL_DROP_MASTER
+    print('OK')
+except Exception as e:
+    print(str(e))
+    exit(1)
+finally:
+    os.close(fd)
+" 2>/dev/null; then
+            DRM_READY=1
+            echo "[$(date)] DRM master available after ${i}s" >> /var/log/kaos-init.log
+            break
+        fi
+        sleep 1
+    done
+    if [ "$DRM_READY" = "0" ]; then
+        echo "[$(date)] WARNING: DRM master not available after 30s, proceeding anyway" >> /var/log/kaos-init.log
+    fi
+fi
+
+seatd -g root -l debug > /var/log/seatd.log 2>&1 &
+sleep 1
+
+# 3b. Start touch input daemon (creates uinput touchscreen)
+# Must start BEFORE phoc so the device exists when libinput enumerates.
+# PID is saved to file so the process monitor (runs in subshell) can track it.
+kaos-touch-input > /var/log/touch-input.log 2>&1 &
+echo $! > /var/run/kaos-touch.pid
+sleep 1
+
+# 3c. Populate udev database for the touch device
+# systemd-udevd is not available in this namespace (no systemd).
+# We use udevadm trigger to process rules, but since there is no daemon
+# listening, we manually write the udev database entries that libinput
+# needs: ID_INPUT=1, ID_INPUT_TOUCHSCREEN=1, and the "seat" tag.
+# The seat tag is critical — libinput's udev_enumerate filters by it.
+populate_udev_touch() {
+    # Find the kaos-touch event device
+    for sysdev in /sys/class/input/event*/device/name; do
+        NAME=$(cat "$sysdev" 2>/dev/null)
+        if [ "$NAME" = "kaos-touch" ]; then
+            EVDEV=$(echo "$sysdev" | sed 's|/sys/class/input/\(event[0-9]*\)/.*|\1|')
+            MAJOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f1)
+            MINOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f2)
+            INPUTNUM=$(echo "$EVDEV" | sed 's/event//')
+
+            # Write the event device db entry
+            mkdir -p /run/udev/data /run/udev/tags/seat
+            cat > "/run/udev/data/c${MAJOR}:${MINOR}" << UDEVEOF
+I:$(date +%s)
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+V:1
+UDEVEOF
+            # Write the parent input device db entry
+            cat > "/run/udev/data/+input:input${INPUTNUM}" << UDEVEOF
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+V:1
+UDEVEOF
+            # Create seat tag symlinks
+            ln -sf "/run/udev/data/c${MAJOR}:${MINOR}" "/run/udev/tags/seat/c${MAJOR}:${MINOR}"
+            ln -sf "/run/udev/data/+input:input${INPUTNUM}" "/run/udev/tags/seat/+input:input${INPUTNUM}"
+
+            # Ensure device is world-readable (seatd opens on behalf of phoc)
+            chmod 666 "/dev/input/$EVDEV"
+
+            echo "[$(date)] Registered $EVDEV (c${MAJOR}:${MINOR}) as touchscreen with seat tag" >> /var/log/kaos-init.log
+            return 0
+        fi
+    done
+    echo "[$(date)] WARNING: kaos-touch device not found in /sys" >> /var/log/kaos-init.log
+    return 1
+}
+populate_udev_touch
+
+# 3d. In DRM mode, register fts hardware touchscreen
+if [ "$LINUX_DIRECT_MODE" = "1" ]; then
+    for sysdev in /sys/class/input/event*/device/name; do
+        NAME=$(cat "$sysdev" 2>/dev/null)
+        if [ "$NAME" = "fts" ]; then
+            EVDEV=$(echo "$sysdev" | sed 's|/sys/class/input/\(event[0-9]*\)/.*|\1|')
+            MAJOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f1)
+            MINOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f2)
+            INPUTNUM=$(echo "$EVDEV" | sed 's/event//')
+            mkdir -p /run/udev/data /run/udev/tags/seat
+            cat > "/run/udev/data/c${MAJOR}:${MINOR}" << UDEVEOF
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+UDEVEOF
+            cat > "/run/udev/data/+input:input${INPUTNUM}" << UDEVEOF
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+UDEVEOF
+            ln -sf "/run/udev/data/c${MAJOR}:${MINOR}" "/run/udev/tags/seat/c${MAJOR}:${MINOR}"
+            ln -sf "/run/udev/data/+input:input${INPUTNUM}" "/run/udev/tags/seat/+input:input${INPUTNUM}"
+            chmod 666 "/dev/input/$EVDEV"
+            echo "[$(date)] DRM mode: registered fts ($EVDEV)" >> /var/log/kaos-init.log
+            break
+        fi
+    done
+fi
+
+# 3e. Detect whether a display manager is actually configured before ever
+# trying to start one. Uses the systemd unit-alias symlink convention
+# (/etc/systemd/system/display-manager.service -> the active DM's unit) --
+# this is a static file written by the DM package's postinst at install
+# time, so it's readable here even though this namespace doesn't run real
+# systemd. A rootfs with no DM package installed (e.g. a bare debootstrap
+# base) has no such symlink, and previously that meant an infinite Phosh
+# restart loop (~30s cycle, forever) for something that was never asked
+# to run Phosh in the first place.
+HAS_DM=0
+if [ -L /etc/systemd/system/display-manager.service ]; then
+    DM_UNIT_TARGET=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)
+    if [ -n "$DM_UNIT_TARGET" ] && [ -f "$DM_UNIT_TARGET" ]; then
+        HAS_DM=1
+        echo "[$(date)] Display manager configured: $DM_UNIT_TARGET" >> /var/log/kaos-init.log
+    fi
+fi
+[ "$HAS_DM" = "0" ] && echo "[$(date)] No display-manager.service configured -- skipping Phosh/UI stack" >> /var/log/kaos-init.log
+
+# 4. Process Monitor Loop (Background)
+PHOSH_PID=0
+TOUCH_PID=$(cat /var/run/kaos-touch.pid 2>/dev/null || echo 0)
+STREAM_PID=0
+PHOSH_FAILS=0
+(
+    while true; do
+        # --- Phosh stack (only if a display manager is actually configured) ---
+        if [ "$HAS_DM" = "1" ]; then
+            if [ $PHOSH_PID -eq 0 ] || ! kill -0 $PHOSH_PID 2>/dev/null; then
+                PHOSH_FAILS=$((PHOSH_FAILS + 1))
+                DELAY=$((PHOSH_FAILS * 5))
+                [ $DELAY -gt 30 ] && DELAY=30
+                rm -f $XDG_RUNTIME_DIR/wayland-*
+                echo "[$(date)] Starting Phosh stack (attempt $PHOSH_FAILS)..." >> /var/log/kaos-init.log
+                dbus-run-session phosh-session > /var/log/phosh.log 2>&1 &
+                PHOSH_PID=$!
+                sleep $DELAY
+            else
+                PHOSH_FAILS=0
+            fi
+        fi
+
+        # --- Touch input daemon (uinput touchscreen) ---
+        if [ $TOUCH_PID -eq 0 ] || ! kill -0 $TOUCH_PID 2>/dev/null; then
+            echo "[$(date)] Starting touch input daemon..." >> /var/log/kaos-init.log
+            kaos-touch-input > /var/log/touch-input.log 2>&1 &
+            TOUCH_PID=$!
+        fi
+
+        # --- Video stream (wf-recorder → ffmpeg → unix socket) ---
+        # Skip in DRM mode — display is driven directly by DRM/KMS.
+        # Skip entirely if no DM — nothing is rendering to capture.
+        if [ "$HAS_DM" = "1" ] && [ "$LINUX_DIRECT_MODE" = "0" ] && [ -S /dev/socket/kaos_ui.sock ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+            if [ $STREAM_PID -eq 0 ] || ! kill -0 $STREAM_PID 2>/dev/null; then
+                echo "[$(date)] Starting UI Stream..." >> /var/log/kaos-init.log
+                WAYLAND_DISPLAY=wayland-0 \
+                wf-recorder -c rawvideo -p pixel_format=rgba -m rawvideo -f pipe:1 2>>/var/log/wf.log | \
+                ffmpeg -f rawvideo -pixel_format rgba -video_size 1080x2340 -i pipe:0 \
+                       -f rawvideo -y unix:/dev/socket/kaos_ui.sock >> /var/log/wf.log 2>&1 &
+                STREAM_PID=$!
+            fi
+        fi
+
+        sleep 5
+    done
+) &
+
+echo "Kaos Native Wayland Pipeline Active (libinput touch)." >> /var/log/kaos-init.log
+exec tail -f /dev/null
+INITEOF
+    chmod +x "$CHROOT/usr/local/sbin/kaos-init"
+    # Patch hostname in init script to match distro config
+    sed -i "s/hostname kaos/hostname ${DISTRO_HOSTNAME}/" "$CHROOT/usr/local/sbin/kaos-init"
+
+
+
+
+
+    # NOTE: sailfish-fixup.sh invocation removed (July 2026). The rootfs is
+    # built for perseus by the droid-config sparse tree — no fixup is needed,
+    # and the script's compositor rewrite (Mesa/eglfs) would clobber the
+    # active hwcomposer QPA display configuration.
+
+    # Check for Linux direct mode.
+    # Only enable via explicit property — never auto-detect from os-release.
+    # Auto-detect was dangerous: starting a SailfishOS namespace killed Android services.
+    LINUX_MODE=$(getprop persist.kaos.linux_mode)
+    if [ -f "$REAL_CHROOT/etc/os-release" ] && grep -q 'sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null; then
+        log "SailfishOS detected — full mode requires: setprop persist.kaos.linux_mode 1"
+    fi
+    if [ "$LINUX_MODE" = "1" ]; then
+        touch "$CHROOT/tmp/.linux_mode"
+        log "Linux Direct Mode enabled (DRM + native touch)"
+
+        # Stop Android services not needed in Linux mode
+        # kaos-service runs as u:r:toolbox:s0 which can't set ctl.stop properties
+        # Use runcon to switch to su context for the stop commands
+
+        # Tier 1: Display stack (must stop to release DRM master)
+        runcon u:r:su:s0 stop surfaceflinger 2>/dev/null
+        runcon u:r:su:s0 stop vendor.hwcomposer-2-3 2>/dev/null
+        runcon u:r:su:s0 stop vendor.qti.hardware.display.allocator 2>/dev/null
+        runcon u:r:su:s0 stop display-color-hal-1-0 2>/dev/null
+        runcon u:r:su:s0 stop vendor.livedisplay-hal 2>/dev/null
+        runcon u:r:su:s0 stop vendor.livedisplay-sdm 2>/dev/null
+        runcon u:r:su:s0 stop gpu 2>/dev/null
+        runcon u:r:su:s0 stop bootanim 2>/dev/null
+        runcon u:r:su:s0 stop ppd 2>/dev/null
+
+        # Tier 2: Android framework (frees ~500MB RAM)
+        runcon u:r:su:s0 stop zygote 2>/dev/null
+        runcon u:r:su:s0 stop zygote_secondary 2>/dev/null
+
+        # Tier 3: Media/camera/codec (not needed in Linux mode)
+        runcon u:r:su:s0 stop audioserver 2>/dev/null
+        runcon u:r:su:s0 stop vendor.audio-hal 2>/dev/null
+        runcon u:r:su:s0 stop cameraserver 2>/dev/null
+        runcon u:r:su:s0 stop vendor.camera-provider-2-4 2>/dev/null
+        runcon u:r:su:s0 stop media 2>/dev/null
+        runcon u:r:su:s0 stop mediaextractor 2>/dev/null
+        runcon u:r:su:s0 stop mediametrics 2>/dev/null
+        runcon u:r:su:s0 stop media.swcodec 2>/dev/null
+        runcon u:r:su:s0 stop vendor.media.omx 2>/dev/null
+        runcon u:r:su:s0 stop vendor.vppservice 2>/dev/null
+        runcon u:r:su:s0 stop wfdhdcphalservice 2>/dev/null
+        runcon u:r:su:s0 stop wifidisplayhalservice 2>/dev/null
+
+        # Tier 4: Android-only services (DRM content, telemetry, payments, misc)
+        runcon u:r:su:s0 stop drm 2>/dev/null
+        runcon u:r:su:s0 stop vendor.drm-clearkey-service 2>/dev/null
+        runcon u:r:su:s0 stop vendor.drm-widevine-hal-1-2 2>/dev/null
+        runcon u:r:su:s0 stop vendor.cas-hal-1-2 2>/dev/null
+        runcon u:r:su:s0 stop credstore 2>/dev/null
+        runcon u:r:su:s0 stop incidentd 2>/dev/null
+        runcon u:r:su:s0 stop statsd 2>/dev/null
+        runcon u:r:su:s0 stop storaged 2>/dev/null
+        runcon u:r:su:s0 stop traced 2>/dev/null
+        runcon u:r:su:s0 stop traced_probes 2>/dev/null
+        runcon u:r:su:s0 stop neuralnetworks_hal_service 2>/dev/null
+        runcon u:r:su:s0 stop vendor.fingerprint-default 2>/dev/null
+        runcon u:r:su:s0 stop vendor.nfc_hal_service 2>/dev/null
+        runcon u:r:su:s0 stop vendor.mlipay-1-1 2>/dev/null
+        runcon u:r:su:s0 stop soter-1-0 2>/dev/null
+        runcon u:r:su:s0 stop tui_comm-1-0 2>/dev/null
+        runcon u:r:su:s0 stop qteeconnector-hal-1-0 2>/dev/null
+        runcon u:r:su:s0 stop qti_esepowermanager_service 2>/dev/null
+        runcon u:r:su:s0 stop secureelement-hal 2>/dev/null
+        runcon u:r:su:s0 stop sensorscal-hal-1-0 2>/dev/null
+        runcon u:r:su:s0 stop vendor.capabilityconfigstore 2>/dev/null
+        runcon u:r:su:s0 stop seemp_healthd 2>/dev/null
+        runcon u:r:su:s0 stop lhd 2>/dev/null
+        runcon u:r:su:s0 stop dpmQmiMgr 2>/dev/null
+        runcon u:r:su:s0 stop dpmd 2>/dev/null
+        runcon u:r:su:s0 stop vendor.port-bridge 2>/dev/null
+        runcon u:r:su:s0 stop hidl_memory 2>/dev/null
+        runcon u:r:su:s0 stop vendor.qti.hardware.memtrack 2>/dev/null
+
+        sleep 2
+        # Verify display stack stopped; force kill if still running
+        local sf_pid=$(pidof surfaceflinger 2>/dev/null)
+        local hwc_pid=$(pidof android.hardware.graphics.composer@2.3-service 2>/dev/null)
+        if [ -n "$sf_pid" ] || [ -n "$hwc_pid" ]; then
+            log "WARNING: SF/HWC still running after stop, force killing (SF=$sf_pid HWC=$hwc_pid)"
+            [ -n "$sf_pid" ] && kill -9 $sf_pid 2>/dev/null
+            [ -n "$hwc_pid" ] && kill -9 $hwc_pid 2>/dev/null
+            sleep 1
+        fi
+        log "Stopped Android services for Linux Direct Mode"
+    else
+        rm -f "$CHROOT/tmp/.linux_mode"
+    fi
+
+    # Launch namespace with full isolation
+    # mount --make-rprivate / is required to allow unshare on Android
+    runcon u:r:su:s0 mount --make-rprivate /
+
+    # Use our static unshare_kaos which supports all namespace flags including -C (cgroup)
+    # Flags: -m mount, -p pid, -u uts, -i ipc, -C cgroup, -f fork
+    # Note: -n (net) omitted — chroot needs Android's network stack
+    # -C (cgroup) re-added 2026-08-28 -- see Phase 1b below for why it's
+    # required (without it, systemd's own cgroup management runs on
+    # Android's real, shared cgroup2 tree instead of a private one, which
+    # was root-caused as the direct trigger for zygote getting killed and
+    # bootanim retriggering on every namespace start). -C was previously
+    # removed because mounting a *new named v1 hierarchy* from inside one
+    # fails with EPERM -- Phase 1b no longer does that; it mounts the
+    # existing cgroup2 filesystem instead, which -C handles correctly.
+    # If kernel doesn't support a flag, fall back gracefully
+    UNSHARE_BIN="/system/bin/unshare_kaos"
+    UNSHARE_FLAGS="-m -p -u -i -C -f"
+    if ! runcon u:r:su:s0 $UNSHARE_BIN $UNSHARE_FLAGS -- /system/bin/echo "ns_test" > /dev/null 2>&1; then
+        log "Full namespace isolation not supported, falling back to mount+pid only"
+        UNSHARE_FLAGS="-m -p -f"
+    fi
+
+    # Create namespace entry script that mounts /proc and /sys before running init
+    # Systemd and kaos-init both need these — mount them after unshare
+    # creates the new PID/mount namespace but before init starts
+    cat > "$CHROOT/usr/local/sbin/ns-entry.sh" << 'NSEOF'
+#!/bin/sh
+# HybridOS Namespace Entry - Dynamic init for any Linux distribution
+# Detects the OS environment and adapts accordingly.
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LOG=/var/log/ns-entry.log
+log() { echo "[ns-entry] $(date '+%H:%M:%S') $*" >> $LOG; }
+
+log "PID=$$ starting namespace entry"
+
+# --- Phase 1: Minimal filesystem mounts ---
+# Only mount what the OS's own init doesn't handle.
+# Some inits (preinit, systemd) re-mount these themselves,
+# but they need /proc at minimum to function.
+
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+
+# Some mount(8) implementations (confirmed live 2026-08-27: toybox's, at
+# least for the "cgroup" fs type) refuse to mount at all without /etc/mtab
+# present, failing with "failed to read mtab: No such file or directory" --
+# this bare debootstrap rootfs never had one (normally created by the
+# mount/util-linux package's postinst, which this minbase image doesn't
+# include). The standard fix on any modern system is this exact symlink.
+[ -e /etc/mtab ] || ln -sf /proc/self/mounts /etc/mtab 2>/dev/null
+
+# do_mounts() already bind-mounted the host's /dev/socket onto this
+# chroot's /dev/socket before we ever got here (see kaos-service) -- but
+# the very next command wipes it: mounting a fresh tmpfs over /dev shadows
+# everything underneath, submounts included, the same way it would shadow
+# a plain file or directory. A shell's current working directory is a
+# kernel-level dentry reference, not a path -- cd'ing into the bind mount
+# now, before the tmpfs remount, keeps that reference alive regardless of
+# what gets mounted over the path it used to be reachable through, so it
+# can be bound back afterward via /proc/self/cwd. Confirmed live
+# 2026-08-27 in isolation (a throwaway namespace, not this one) that this
+# genuinely round-trips real content across the remount; every other
+# do_mounts() bind mount (/system, /vendor, /dev/dri) already survives
+# unshare_kaos + chroot fine without this, so this is the one exception,
+# not a pattern to generalize.
+cd /dev/socket 2>/dev/null
+
+# /dev: mount as tmpfs and populate essential nodes.
+# We cannot use devtmpfs (kernel singleton shared with Android host).
+mount -t tmpfs tmpfs /dev -o mode=0755 2>/dev/null
+mkdir -p /dev/pts /dev/shm /dev/mqueue
+
+# Restore /dev/socket (see the cd above) now that the fresh /dev exists to
+# put it back into. Harmless if the cd above silently failed (do_mounts()
+# bind mount missing for some reason) -- mkdir/mount just target an empty
+# tmpfs directory instead, no worse off than before this fix existed.
+mkdir -p /dev/socket
+mount --bind /proc/self/cwd /dev/socket 2>/dev/null
+
+# /dev/null first, and WITHOUT a "2>/dev/null" of its own -- /dev is a
+# freshly emptied tmpfs at this point, so /dev/null does not exist yet, and
+# a "2>/dev/null" redirect on the very command that creates it races
+# against itself: the shell has to open (and, since nothing is there yet,
+# create) a plain regular file at /dev/null just to set up that redirect,
+# and by the time mknod's own syscall runs a moment later, something
+# already exists at that path -- mknod fails with EEXIST, silently, into
+# the bogus file its own redirect just made. Confirmed live 2026-08-27:
+# this is exactly why /dev/null kept ending up as a 0-byte regular file
+# instead of a real character device, which in turn made agetty segfault
+# stat()ing /dev/console (a symlink to that broken /dev/null). Every other
+# node's own mknod is safe to self-redirect since by the time they run,
+# /dev/null already exists for real.
+mknod -m 0666 /dev/null c 1 3
+
+for node in "zero c 1 5 0666" "full c 1 7 0666" \
+            "random c 1 8 0666" "urandom c 1 9 0666" "tty c 5 0 0666" \
+            "tty0 c 4 0 0620" "tty1 c 4 1 0620" "tty7 c 4 7 0620"; do
+    set -- $node
+    mknod -m "$4" "/dev/$1" $2 $3 2>/dev/null
+done
+
+# Console: real device unavailable in namespace, redirect to null
+ln -sf /dev/null /dev/console
+# Standard fd symlinks
+ln -sf /proc/self/fd /dev/fd
+ln -sf /proc/self/fd/0 /dev/stdin
+ln -sf /proc/self/fd/1 /dev/stdout
+ln -sf /proc/self/fd/2 /dev/stderr
+
+mount -t devpts devpts /dev/pts -o newinstance,gid=5,mode=620,ptmxmode=666 2>/dev/null
+
+# Standard convention (every mainstream distro's udev/systemd-tmpfiles does
+# this): /dev/ptmx as a symlink to the devpts instance's own ptmx
+# multiplexer, so pty allocation actually goes through THIS namespace's
+# devpts instance rather than missing entirely or falling through to a
+# stale/global one. Confirmed live 2026-08-27: without this, /dev/ptmx
+# didn't exist at all despite /dev/pts/ptmx being present and correct, and
+# Python's pty.spawn() (used by both TerminalActivity's chroot shell and,
+# transitively, anything else that allocates a pty in here) failed outright
+# with "OSError: out of pty devices".
+ln -sf pts/ptmx /dev/ptmx
+
+mount -t tmpfs tmpfs /dev/shm -o mode=1777,nosuid,nodev 2>/dev/null
+
+# /run and /tmp: always mount fresh (init expects them empty)
+mount -t tmpfs tmpfs /run -o mode=0755,nosuid,nodev 2>/dev/null
+mount -t tmpfs tmpfs /tmp -o mode=1777,nosuid,nodev 2>/dev/null
+
+# --- Phase 1b: Private cgroup hierarchy for systemd ---
+# systemd needs somewhere to track its own units via a real, writable
+# cgroup2 root, genuinely isolated from Android's own cgroup tree. Requires
+# the cgroup namespace (-C, unshare_kaos).
+#
+# Root-caused live 2026-08-28: starting kaos_mainline was reliably causing
+# a brief display flicker, Android's zygote getting SIGKILLed and
+# restarted, and bootanim retriggering, on every single start. Ruled out
+# kaos-display-bridge entirely (still happened with it removed from the
+# device), ruled out every step of this script's own mount/namespace setup
+# up to (but excluding) "exec $INIT" (still happened with ns-entry.sh's
+# own sequence run to completion but stopped right before that exec),
+# which isolated it to systemd's own startup -- then confirmed directly
+# that kaos_mainline's PID 1 shared the *exact same* cgroup namespace
+# inode as Android's real init (readlink /proc/1/ns/cgroup vs
+# /proc/<pid>/ns/cgroup, byte-for-byte identical). Without -C, systemd's
+# own cgroup management (creating its init.scope/system.slice, moving
+# processes) was operating directly on Android's real, shared cgroup2
+# tree, not a private one.
+#
+# -C was tried before this and abandoned specifically because mounting a
+# NEW cgroup v1 NAMED hierarchy (mount -t cgroup -o none,name=X) from
+# inside a cgroup namespace fails with EPERM -- a real, unavoidable kernel
+# restriction on creating brand-new top-level hierarchies from within one.
+# That turned out to be narrower than it looked: mounting the *existing*
+# cgroup2 unified filesystem (what Android's own /sys/fs/cgroup actually
+# already is) works fine from inside a cgroup namespace, and -C makes that
+# mount show only this process's own (now-namespace-root) subtree instead
+# of Android's real one. Confirmed live 2026-08-28: mount -t cgroup2 none
+# /sys/fs/cgroup succeeds (no EPERM) and yields a real, isolated, writable
+# cgroup2 root (cgroup.procs/cgroup.controllers/cgroup.subtree_control all
+# present, no trace of Android's real uid_* cgroups) -- both mkdir of a
+# sub-cgroup and writing a PID into its cgroup.procs succeed too, which is
+# exactly what systemd needs for its own slices/scopes.
+HAS_CGROUP=0
+if mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; then
+    HAS_CGROUP=1
+    log "Private cgroup2 root mounted (isolated via -C cgroup namespace)"
+else
+    log "WARNING: cgroup2 mount failed"
+fi
+
+# --- Phase 2: Environment setup ---
+unset LD_PRELOAD
+export container=kaos
+
+# ns-entry.sh inherits whatever umask its ancestor chain (kaos-bridge, etc.)
+# happened to have -- kaos-bridge itself runs with 0077. Confirmed live
+# 2026-08-27: that leaked into Phase 4's "mkdir -p /run/systemd/system"
+# below, silently creating /run/systemd itself as 0700 instead of the usual
+# 0755. Real systemd (PID 1) never re-chmods a dir that already exists when
+# it later populates /run/systemd/notify etc, so the 0700 parent stuck
+# around -- and since dbus-daemon (and any other Type=notify service) runs
+# as an unprivileged user (messagebus, uid 100), it lost search permission
+# on /run/systemd and every sendmsg() to the notify socket failed with
+# EACCES. sd_notify() failures are silent/non-fatal by design, so the only
+# visible symptom was systemd never seeing READY=1 and the unit sitting in
+# "activating" for the full 90s TimeoutStartSec before being killed. A sane
+# 022 umask here (before Phase 4's mkdir, and before init's own exec) fixes
+# this at the root instead of chmod-patching every directory Phase 4 creates.
+umask 022
+
+# --- Phase 3: Detect OS ---
+DISTRO_ID="unknown"
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO_ID="${ID:-unknown}"
+fi
+log "Detected OS: $DISTRO_ID ($PRETTY_NAME)"
+
+# --- Phase 4: Mask hardware services that conflict with Android ---
+# When running alongside Android, these services fight for shared hardware
+# (uevents, USB gadget, bluetooth HCI, network interfaces, sensors).
+# Masking is done via /run (tmpfs) so the rootfs is untouched — a native
+# boot from boot selector will still have all services enabled.
+#
+# SailfishOS full mode: In Linux Direct Mode, SailfishOS needs droid-hal-init
+# to manage Android HALs (GPU, display, sensors). Android equivalents have
+# already been stopped by start_namespace(). Only mask truly conflicting
+# services; preserve droid-hal-init, sensorfwd, bluebinder.
+MASK_DIR=/run/systemd/system
+mkdir -p "$MASK_DIR"
+
+SFOS_FULL=0
+if [ "$DISTRO_ID" = "sailfishos" ] && [ -f /tmp/.linux_mode ]; then
+    SFOS_FULL=1
+    log "SailfishOS full mode — preserving droid-hal-init for hardware access"
+fi
+
+# Services always masked (conflict with Android host regardless of distro)
+#
+# systemd-udev-trigger.service root-caused live 2026-08-28: it re-announces
+# ("coldplugs") every kernel device via uevents at boot, independent of
+# whether systemd-udevd.service itself is running -- masking udevd alone
+# (below) does not stop this unit from firing. uevent netlink is a global,
+# non-namespaced kernel interface tied to the network namespace, which this
+# chroot deliberately shares with Android (-n omitted from unshare_kaos so
+# the chroot can use Android's real network stack) -- so this coldplug
+# flood was landing directly on Android's own uevent listeners. Confirmed
+# live: Android's ThermalEngine logging "read error 0" for a burst of
+# duplicate ACTION=add events (every thermal zone/cooling device at once)
+# at the exact same instant SurfaceFlinger retriggered bootanim and zygote
+# got killed, every single time kaos_mainline started.
+for svc in \
+    systemd-udevd.service systemd-udevd-kernel.socket systemd-udevd-control.socket \
+    systemd-udev-trigger.service \
+    usb-moded.service \
+    connman.service connman-vpn.service \
+    ofono.service \
+    nfcd.service \
+    mce.service; do
+    ln -sf /dev/null "$MASK_DIR/$svc"
+done
+
+# console-getty.service always masked (unrelated to the Android-conflict
+# list above): Phase 1 symlinks /dev/console -> /dev/null since there's no
+# real console device available inside the namespace. agetty then fails
+# every launch with "Failed to set up standard input: Inappropriate ioctl
+# for device" (open() succeeds against /dev/null, but ioctl(TIOCGWINSZ) etc
+# need a real tty), and systemd's own restart-rate-limiting hits
+# start-limit-hit after ~20 attempts (confirmed live 2026-08-27) -- this
+# doesn't loop forever like the old un-gated Phosh restart loop did, but a
+# console we already know can never work has no reason to keep retrying at
+# all before giving up.
+ln -sf /dev/null "$MASK_DIR/console-getty.service"
+
+if [ "$SFOS_FULL" = "1" ]; then
+    # SailfishOS full mode: preserve droid-hal-init, sensorfwd, bluebinder
+    log "Masked udev/connman/ofono/nfc/mce — droid-hal-init+sensorfwd+bluebinder preserved"
+else
+    # Headless or non-SailfishOS: mask all hardware-managing services
+    for svc in \
+        sensorfwd.service \
+        bluetooth.service bluebinder.service \
+        droid-hal-init.service droid-late-start.service; do
+        ln -sf /dev/null "$MASK_DIR/$svc"
+    done
+    log "Masked all hardware services for Android coexistence"
+fi
+
+# --- Phase 5: Choose init ---
+# Check if /sbin/init is a systemd symlink
+INIT_IS_SYSTEMD=0
+if [ -L /sbin/init ] && readlink /sbin/init | grep -q systemd; then
+    INIT_IS_SYSTEMD=1
+fi
+
+# Determine init strategy.
+# Systemd as PID 1 needs somewhere to track its own units. Gate on the
+# actual HAS_CGROUP capability probe from Phase 1b, not a kernel version
+# guess -- the old "kernel <5.x lacks cgroup features" check here was wrong:
+# this kernel has full cgroup2/namespace support (confirmed live
+# 2026-08-27), the real constraint was Android's own hybrid v1/v2 cgroup
+# ownership, which the private name=systemd hierarchy above sidesteps
+# entirely. If that mount genuinely failed, don't attempt systemd.
+# The kaos-init script handles Phosh/Wayland; for headless use (CLI
+# tools, SSH, etc.) a simple idle loop keeps the namespace alive while users
+# interact via nsenter/login.
+INIT=""
+if [ "$DISTRO_ID" = "kali" ]; then
+    # /sbin/preinit is for HybridOS boot handoff. In namespace mode we want the
+    # existing namespace init path, not the boot wrapper.
+    CANDIDATES="/usr/local/sbin/kaos-init /sbin/init /usr/lib/systemd/systemd /sbin/preinit"
+else
+    # kaos-init is generated fresh on every start regardless of what the
+    # rootfs actually has, so it always exists -- it must come AFTER real
+    # init candidates or it always wins even when the rootfs has a genuine
+    # systemd install. Confirmed live 2026-08-27: with systemd installed and
+    # HAS_CGROUP=1, the old ordering (kaos-init first) still picked kaos-init
+    # every time, because the loop takes the first *existing* executable, not
+    # the first capable one. Real init > our synthetic Phosh fallback.
+    CANDIDATES="/sbin/preinit /sbin/init /usr/lib/systemd/systemd /usr/local/sbin/kaos-init"
+fi
+for candidate in $CANDIDATES; do
+    [ -x "$candidate" ] || continue
+    IS_SYSTEMD_CANDIDATE=0
+    [ "$candidate" = "/sbin/init" ] && [ "$INIT_IS_SYSTEMD" = "1" ] && IS_SYSTEMD_CANDIDATE=1
+    [ "$candidate" = "/usr/lib/systemd/systemd" ] && IS_SYSTEMD_CANDIDATE=1
+    if [ "$IS_SYSTEMD_CANDIDATE" = "1" ] && [ "$HAS_CGROUP" != "1" ]; then
+        log "Skipping systemd candidate $candidate — no private cgroup hierarchy available"
+        continue
+    fi
+    INIT="$candidate"
+    break
+done
+
+# Ultimate fallback: idle loop that keeps the namespace alive for nsenter
+if [ -z "$INIT" ]; then
+    log "No compatible init found — starting idle namespace keeper"
+    log "Use 'kaos-starter login' or nsenter to interact"
+    # Set hostname, start basic services
+    hostname "${DISTRO_ID}-kaos" 2>/dev/null
+    # Start SSH if available
+    if [ -x /usr/sbin/sshd ]; then
+        mkdir -p /run/sshd
+        /usr/sbin/sshd 2>/dev/null && log "sshd started"
+    fi
+    # Start cron if available
+    if [ -x /usr/sbin/cron ]; then
+        /usr/sbin/cron 2>/dev/null && log "cron started"
+    fi
+    # Idle loop — keep PID 1 alive, reap zombies
+    trap 'log "Received SIGTERM, shutting down"; exit 0' TERM
+    while true; do
+        wait 2>/dev/null || sleep 60
+    done
+fi
+
+log "Selected init: $INIT"
+
+# --- Phase 6: Exec init ---
+exec $INIT 2>> $LOG
+NSEOF
+    chmod +x "$CHROOT/usr/local/sbin/ns-entry.sh"
+
+    mkdir -p "$CHROOT/var/log"
+    runcon u:r:su:s0 $UNSHARE_BIN $UNSHARE_FLAGS -- /system/bin/chroot "$CHROOT" /usr/local/sbin/ns-entry.sh > "$CHROOT/var/log/namespace-boot.log" 2>&1 &
+    MAIN_PID=$!
+
+    sleep 1
+    if ! kill -0 "$MAIN_PID" 2>/dev/null; then
+        log "ERROR: ${DISTRO_NAME} namespace exited immediately. Check $CHROOT/var/log/namespace-boot.log and $CHROOT/var/log/ns-entry.log"
+        return 1
+    fi
+
+    # Start the Virtual Touch Input Daemon
+    runcon u:r:su:s0 /system/bin/kaos-touch-input &
+    echo $! > "$INPUT_PID_FILE"
+
+    # Start the SurfaceFlinger display bridge — only relevant in headless
+    # overlay mode (kaos-init's wf-recorder pipeline feeds it frames over
+    # /dev/socket/kaos_ui.sock). In LINUX_DIRECT_MODE phoc owns /dev/dri
+    # directly and nothing captures/relays frames, so it would sit idle;
+    # skip starting it there.
+    if [ "$LINUX_MODE" != "1" ]; then
+        runcon u:r:su:s0 /system/bin/kaos-display-bridge > "$CHROOT/var/log/kaos-display-bridge.log" 2>&1 &
+        echo $! > "$DISPLAY_BRIDGE_PID_FILE"
+    fi
+
+    echo $MAIN_PID > "$PID_FILE"
+    chmod 644 "$PID_FILE"
+    echo -1000 > /proc/$MAIN_PID/oom_score_adj 2>/dev/null || true
+
+    log "${DISTRO_NAME} namespace started. Host PID: $MAIN_PID"
+    do_detect
+}
+
+# === Stop Namespace ===
+stop_namespace() {
+    if [ ! -f "$PID_FILE" ]; then
+        log "${DISTRO_NAME} is not running (no PID file)."
+        return 1
+    fi
+
+    TARGET_PID=$(cat "$PID_FILE")
+    log "Stopping ${DISTRO_NAME} (Host PID $TARGET_PID)..."
+
+    # $TARGET_PID is the OUTER unshare_kaos wrapper (unshare -f forks and
+    # waits), not the process running as PID 1 inside the new PID namespace.
+    # Killing only the wrapper leaves the whole namespace -- kaos-init, its
+    # background monitor subshell, Phosh, touch-input, everything -- orphaned
+    # and still running, reparented to host PID 1, forever. Confirmed live
+    # 2026-08-27: two stale kaos_mainline instances survived repeated "stop"
+    # calls this exact way, continuing to write into the shared
+    # kaos-init.log for hours and making the fix look broken when it wasn't.
+    # The kernel guarantees that killing a PID namespace's own PID 1
+    # immediately SIGKILLs every other process in that namespace -- find it
+    # via /proc/<wrapper>/task/<wrapper>/children (direct child, no pgrep
+    # dependency) and kill THAT first so the whole tree goes down atomically.
+    NS_INIT_PID=$(cat "/proc/$TARGET_PID/task/$TARGET_PID/children" 2>/dev/null | awk '{print $1}')
+    if [ -n "$NS_INIT_PID" ]; then
+        log "Killing namespace PID 1 (host PID $NS_INIT_PID) to tear down the whole namespace..."
+        kill -KILL "$NS_INIT_PID" 2>/dev/null
+    fi
+
+    kill -TERM "$TARGET_PID" 2>/dev/null
+    sleep 2
+    if kill -0 "$TARGET_PID" 2>/dev/null; then
+        kill -KILL "$TARGET_PID" 2>/dev/null
+    fi
+
+    # Kill Input Daemon
+    if [ -f "$INPUT_PID_FILE" ]; then
+        kill -9 $(cat "$INPUT_PID_FILE") 2>/dev/null
+        rm "$INPUT_PID_FILE"
+    fi
+
+    # Kill Display Bridge (sends CMD_QUIT first so it unlinks its sockets
+    # cleanly; SIGKILL as a fallback if it's wedged)
+    if [ -f "$DISPLAY_BRIDGE_PID_FILE" ]; then
+        BRIDGE_PID=$(cat "$DISPLAY_BRIDGE_PID_FILE")
+        kill -TERM "$BRIDGE_PID" 2>/dev/null
+        sleep 1
+        kill -0 "$BRIDGE_PID" 2>/dev/null && kill -KILL "$BRIDGE_PID" 2>/dev/null
+        rm "$DISPLAY_BRIDGE_PID_FILE"
+    fi
+
+    rm -f "$PID_FILE"
+
+    # Unmount all chroot mounts (reverse order)
+    for m in system vendor sdcard dev/dri dev/pts dev/shm dev proc sys ""; do
+        umount -l "$CHROOT/$m" 2>/dev/null
+    done
+    # Unmount the base bind mount
+    distro_umount
+
+    log "${DISTRO_NAME} namespace stopped."
+    do_detect
+}
+
+# === Show Status ===
+show_status() {
+    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        echo "Active (PID $(cat $PID_FILE))"
+    else
+        [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
+        echo "Inactive"
+    fi
+}
+
+# === Main ===
+case "$1" in
+    start)
+        start_namespace
+        ;;
+    stop)
+        stop_namespace
+        ;;
+    restart)
+        stop_namespace
+        sleep 1
+        start_namespace
+        ;;
+    status)
+        show_status
+        ;;
+    mounts)
+        do_mounts
+        ;;
+    detect)
+        do_detect
+        ;;
+    *)
+        echo "Usage: $0 [--distro <name>] {start|stop|restart|status|mounts|detect}"
+        exit 1
+        ;;
+esac

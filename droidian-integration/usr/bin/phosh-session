@@ -1,0 +1,63 @@
+#!/bin/sh
+
+COMPOSITOR="/usr/bin/phoc"
+PHOC_INI="/usr/share/phosh/phoc.ini"
+GNOME_SESSION=${GNOME_SESSION:-gnome-session}
+
+help()
+{
+  cat <<EOF
+phosh-session - Session start script for Phosh
+
+This is usually invoked by a display manager but you can
+also run it from a tty.
+
+Usage: phosh
+EOF
+  exit 0
+}
+
+
+version()
+{
+   echo "0.49.0"
+   exit 0
+}
+
+case "$1" in
+  -h|-\?|--help)
+    help
+    ;;
+  --version)
+    version
+    ;;
+esac
+
+if [ -x /usr/bin/phoc ]; then
+  COMPOSITOR=/usr/bin/phoc
+fi
+
+if [ -f /etc/phosh/phoc.ini ]; then
+  PHOC_INI=/etc/phosh/phoc.ini
+fi
+
+if [ -f "$HOME/.phoshdebug" ]; then
+  echo "WARN: .phoshdebug found."
+  . "$HOME/.phoshdebug"
+fi
+
+# HYBRIDOS PATCH (2026-08-20): upstream wraps phoc through
+# "systemd-cat -t phoc" here, which forces phoc's stdout/stderr into a
+# fresh pipe straight to the journal, unconditionally overriding whatever
+# StandardOutput=/StandardError= the systemd unit itself configured.
+# journald's persistent storage never initializes on this device (see
+# SetupManager.java's phosh.service debug-logging comment), so phoc's real
+# crash output was going into a journal that gets wiped every boot. Leave
+# SYSTEMD_CAT unset so phoc inherits the unit's own configured fds instead.
+SYSTEMD_CAT=
+
+[ -n "$WLR_BACKENDS" ] || WLR_BACKENDS=drm,libinput
+export WLR_BACKENDS
+# Run gnome-session through a login shell so it picks
+# variables from /etc/profile.d (XDG_*)
+exec $SYSTEMD_CAT "${COMPOSITOR}" -v -S -C "${PHOC_INI}" -E "bash -lc 'exec ${GNOME_SESSION} --disable-acceleration-check --session=phosh'"

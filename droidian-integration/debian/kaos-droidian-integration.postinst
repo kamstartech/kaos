@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Drop-ins under /etc/systemd/system are not automatically reloaded by
+# dh_installsystemd.  Make sure systemd notices the new/updated unit
+# fragments on the running system.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+fi
+
+#DEBHELPER#

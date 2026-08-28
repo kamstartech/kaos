@@ -1,0 +1,12 @@
+# Kaos SELinux Policy - Minimal Version
+# Kaos apps now use sharedUserId="android.uid.shell" so they run as shell domain
+# No custom app domains needed
+
+# ===== Kaos Script Type =====
+# Define type for kaos scripts (vendor partition) - uses vendor_shell_exec instead
+# type kaos_script, exec_type, vendor_file_type, file_type;
+
+# ===== Shell Data Directory Permissions =====
+# Allow shell to manage kaos data directories
+allow shell shell_data_file:dir { create_dir_perms mounton };
+allow shell shell_data_file:file { create_file_perms };

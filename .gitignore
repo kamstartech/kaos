@@ -1,0 +1,24 @@
+# Large chroot tarballs (downloaded at build time or kept locally)
+chroot/*.tar.xz
+chroot/*.tar.gz
+
+# Old/stale boot animation; canonical asset is art/kaos-boot-logo/bootanimation.zip
+prebuilt/system/media/bootanimation.zip
+
+# Build artifacts
+*.apk
+*.img
+*.o
+*.ko
+out/
+.gradle/
+.cxx/
+local.properties
+build/
+
+# Independently git-tracked subprojects (own .git, own history/remote)
+apps/phosh-app/
+kaos-term/
+
+# Tool-specific scratch state
+.opencode-tasks/

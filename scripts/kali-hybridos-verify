@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# Verify that HybridOS handoff preserved the mounts Kali expects.
+#
+
+LOG="/var/log/kali-hybridos-verify.log"
+mkdir -p /var/log 2>/dev/null
+echo "=== kali-hybridos-verify START ===" > "$LOG"
+date >> "$LOG" 2>/dev/null
+
+fail=0
+
+check_dir() {
+    if [ ! -d "$1" ]; then
+        echo "missing dir: $1" >> "$LOG"
+        fail=1
+    fi
+}
+
+check_mount() {
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$1" || {
+            echo "missing mount: $1" >> "$LOG"
+            fail=1
+        }
+    elif ! grep -qs " $1 " /proc/mounts; then
+        echo "missing mount: $1" >> "$LOG"
+        fail=1
+    fi
+}
+
+check_dir /system_root
+check_dir /system
+check_dir /vendor
+check_dir /mnt/vendor/persist
+check_dir /config
+
+check_mount /system_root
+check_mount /system
+check_mount /vendor
+check_mount /mnt/vendor/persist
+check_mount /config
+
+if [ ! -d /system_root/system ]; then
+    echo "missing system-as-root view: /system_root/system" >> "$LOG"
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "HybridOS verify failed" >> "$LOG"
+    exit 1
+fi
+
+echo "HybridOS verify passed" >> "$LOG"
+exit 0

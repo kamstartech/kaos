@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# Kali Pro — compat init (PID 1 fallback)
+# Used when HybridOS boot reaches Kali on kernels that cannot run systemd
+# reliably as PID 1.
+#
+
+LOG="/var/log/kali-compat-init.log"
+mkdir -p /var/log /run /tmp 2>/dev/null
+echo "=== kali-compat-init START PID=$$ ===" > "$LOG"
+date >> "$LOG" 2>/dev/null
+
+mountpoint -q /proc    || mount -t proc proc /proc 2>>"$LOG"
+mountpoint -q /sys     || mount -t sysfs sysfs /sys 2>>"$LOG"
+mountpoint -q /dev     || mount -t devtmpfs devtmpfs /dev 2>>"$LOG"
+mountpoint -q /dev/pts || { mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; } 2>>"$LOG"
+mountpoint -q /run     || mount -t tmpfs tmpfs /run 2>>"$LOG"
+mountpoint -q /tmp     || mount -t tmpfs tmpfs /tmp 2>>"$LOG"
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+
+if [ -f /etc/hostname ]; then
+    HOSTNAME="$(head -n1 /etc/hostname 2>/dev/null)"
+    [ -n "$HOSTNAME" ] && hostname "$HOSTNAME" 2>/dev/null
+fi
+
+if [ -x /usr/sbin/sshd ]; then
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+    for ktype in rsa ecdsa ed25519; do
+        kfile="/etc/ssh/ssh_host_${ktype}_key"
+        [ -f "$kfile" ] || ssh-keygen -t "$ktype" -f "$kfile" -N "" >> "$LOG" 2>&1
+    done
+    /usr/sbin/sshd >> "$LOG" 2>&1
+    echo "sshd started" >> "$LOG"
+fi
+
+if [ -x /usr/sbin/cron ]; then
+    /usr/sbin/cron >> "$LOG" 2>&1
+    echo "cron started" >> "$LOG"
+fi
+
+trap 'echo "compat init stopping" >> "$LOG"; exit 0' TERM INT
+
+echo "compat init entering idle PID 1 loop" >> "$LOG"
+while true; do
+    wait 2>/dev/null || sleep 60
+done

@@ -1,0 +1,69 @@
+# Kaos Init Script - Simplified with Proper Service Chaining
+# Services are chained to avoid race conditions
+
+on post-fs-data
+    # Create directories
+    mkdir /data/local/kaos_system 0755 root root
+    mkdir /data/local/kaos_system/sbin 0755 root root
+    mkdir /data/local/tmp 0771 shell shell
+    mkdir /data/adb 0700 root root
+    mkdir /data/adb/.kaos 0755 root root
+    
+    # Mount TMPFS for SUID support
+    mount tmpfs tmpfs /data/local/kaos_system/sbin mode=0755,uid=0,gid=0
+    
+    # Kaos HybridOS data directories
+    # encryption=None ensures .stowaway is accessible at cold boot
+    # (before vold installs FBE keys) so the trampoline ROM selector
+    # can read distros.conf and switch_root into a distro rootfs.
+    mkdir /data/.stowaway 0755 root root encryption=None
+    # Seed distros.conf only on first boot. The live device had an older vendor
+    # rc that copied this file unconditionally and overwrote user-edited
+    # registry entries on every boot.
+    exec - root root -- /system/bin/sh -c '[ -f /data/.stowaway/distros.conf ] || { cp /system/etc/distros.conf /data/.stowaway/distros.conf && chown root:root /data/.stowaway/distros.conf && chmod 0644 /data/.stowaway/distros.conf; }'
+
+    # HybridOS cold-boot ROM selector is handled by the trampoline init
+    # wrapper which intercepts second_stage and shows a DRM-based menu.
+    # Enable: touch /mnt/vendor/persist/trampoline_primary
+
+on boot
+    write /proc/sys/net/ipv4/ip_forward 1
+    write /proc/sys/net/ipv6/conf/all/forwarding 1
+
+# === Kaos Services ===
+
+# Step 1: Root Bridge (The "Server")
+# This provides root access to the rest of the system via port 30000
+service kaos-bridge /system/bin/kaos-bridge
+    class late_start
+    user root
+    group root
+    seclabel u:r:init:s0
+
+# Step 2: Initializer (The "Client")
+# This tells the bridge to start the chroot, mounts, and namespace
+service kaos-initializer /system/bin/sh -c "sleep 5; /system/bin/kaos-starter auto-boot"
+    class late_start
+    user shell
+    group shell
+    oneshot
+    disabled
+
+# === Triggers ===
+
+on property:sys.boot_completed=1
+    start kaos-bridge
+    start kaos-initializer
+    # If a cold-boot ROM selection is pending, trigger the handover now
+    # that Android is fully booted (same as "adb shell reboot hybridos,<distro>").
+    hybridos_auto_boot
+
+# Status property triggers (for UI/Kaos App)
+on property:kaos.chroot.mounted=true
+    setprop kaos.status "Chroot Active"
+
+on property:kaos.chroot.mounted=false
+    setprop kaos.status "Chroot Inactive"
+
+on property:kaos.chroot.installed=false
+    setprop kaos.status "Chroot Not Installed"

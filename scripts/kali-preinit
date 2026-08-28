@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# Kali Pro — preinit (PID 1)
+# Minimal HybridOS boot wrapper:
+#   1. Ensure essential mounts exist
+#   2. Detect whether systemd is viable on this kernel
+#   3. exec systemd as PID 1, or fall back to kali-compat-init as PID 1
+#
+
+LOG="/var/log/preinit.log"
+mkdir -p /var/log 2>/dev/null
+echo "=== preinit START PID=$$ ===" > "$LOG"
+date >> "$LOG" 2>/dev/null
+
+# ── Phase 1: Mount essentials ──
+mountpoint -q /proc    || mount -t proc proc /proc
+mountpoint -q /sys     || mount -t sysfs sysfs /sys
+mountpoint -q /dev     || mount -t devtmpfs devtmpfs /dev
+mountpoint -q /dev/pts || { mkdir -p /dev/pts; mount -t devpts devpts /dev/pts; }
+mountpoint -q /run     || mount -t tmpfs tmpfs /run
+mountpoint -q /tmp     || mount -t tmpfs tmpfs /tmp
+
+# Ensure critical /dev nodes
+[ -e /dev/null ]    || mknod -m 666 /dev/null c 1 3
+[ -e /dev/zero ]    || mknod -m 666 /dev/zero c 1 5
+[ -e /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9
+[ -e /dev/random ]  || mknod -m 666 /dev/random c 1 8
+[ -e /dev/console ] || mknod -m 600 /dev/console c 5 1
+[ -e /dev/tty ]     || mknod -m 666 /dev/tty c 5 0
+echo "Phase 1: base mounts OK" >> "$LOG"
+
+# ── Phase 2: Environment ──
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+
+if [ -f /etc/hostname ]; then
+    HOSTNAME="$(head -n1 /etc/hostname 2>/dev/null)"
+    [ -n "$HOSTNAME" ] && hostname "$HOSTNAME" 2>/dev/null
+fi
+echo "Phase 2: environment ready" >> "$LOG"
+
+# ── Phase 3: Choose PID 1 target ──
+echo "Phase 3: selecting PID 1 target" >> "$LOG"
+KERNEL_MAJOR="$(uname -r | cut -d. -f1)"
+SYSTEMD_OK=1
+if [ "${KERNEL_MAJOR:-0}" -lt 5 ] 2>/dev/null; then
+    SYSTEMD_OK=0
+    echo "Kernel ${KERNEL_MAJOR}.x detected — skipping systemd" >> "$LOG"
+fi
+
+SYSTEMD_BIN=""
+[ -x /lib/systemd/systemd ] && SYSTEMD_BIN=/lib/systemd/systemd
+[ -x /usr/lib/systemd/systemd ] && SYSTEMD_BIN=/usr/lib/systemd/systemd
+
+if [ "$SYSTEMD_OK" = "1" ] && [ -n "$SYSTEMD_BIN" ]; then
+    echo "exec systemd as PID 1: $SYSTEMD_BIN --unit=kali-hybridos.target" >> "$LOG"
+    sync
+    exec $SYSTEMD_BIN --system --unit=kali-hybridos.target
+fi
+
+# ── Phase 4: Fallback ──
+echo "FALLBACK: exec kali-compat-init as PID 1" >> "$LOG"
+sync
+exec /usr/local/sbin/kali-compat-init

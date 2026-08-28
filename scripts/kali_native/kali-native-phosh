@@ -1,0 +1,103 @@
+#!/system/bin/sh
+# Kali Native Phosh Launcher - DRM Edition
+# Uses DRM backend for direct display access
+
+DISTRO="kali_native"
+STOWAWAY="/data/.stowaway"
+CHROOT="$STOWAWAY/$DISTRO"
+LOG="$CHROOT/var/log/phosh-start.log"
+
+log() {
+    echo "[$(date +%H:%M:%S)] [kali-native-phosh] $*" 
+    echo "[$(date +%H:%M:%S)] [kali-native-phosh] $*" >> "$LOG"
+}
+
+check_prereqs() {
+    [ -d "$CHROOT" ] || { log "ERROR: chroot not found"; return 1; }
+    [ -x "$CHROOT/usr/bin/phosh-session" ] || { log "ERROR: phosh-session not found"; return 1; }
+    [ -e /dev/dri/card0 ] || { log "ERROR: /dev/dri/card0 not found"; return 1; }
+    return 0
+}
+
+do_mounts() {
+    log "Setting up mounts..."
+    
+    # Essential mounts
+    for tmp in proc sys dev run tmp; do
+        dst="$CHROOT/$tmp"
+        [ ! -d "$dst" ] && mkdir -p "$dst"
+    done
+    
+    # Bind mount DRM
+    if [ ! -d "$CHROOT/dev/dri" ]; then
+        mkdir -p "$CHROOT/dev/dri"
+        mount --bind /dev/dri "$CHROOT/dev/dri" 2>/dev/null
+    fi
+    
+    # Bind mount Android system
+    for mnt in /system /vendor /product /linkerconfig; do
+        src="$mnt"
+        dst="$CHROOT$mnt"
+        if [ -d "$src" ] && [ ! -L "$dst" ]; then
+            mkdir -p "$dst" 2>/dev/null
+            mount --bind "$src" "$dst" 2>/dev/null
+        fi
+    done
+    
+    # User runtime
+    mkdir -p "$CHROOT/run/user/100000"
+    chown 100000:100000 "$CHROOT/run/user/100000" 2>/dev/null
+    chmod 700 "$CHROOT/run/user/100000" 2>/dev/null
+    
+    log "Mounts ready"
+}
+
+do_start() {
+    log "=== Starting Kali Native Phosh (DRM) ==="
+    
+    check_prereqs || return 1
+    do_mounts
+    
+    log "Starting phosh-session with DRM backend..."
+    
+    # Start phosh as kali user
+    chroot "$CHROOT" /bin/su - kali -c "
+        export XDG_RUNTIME_DIR=/run/user/100000
+        export WAYLAND_DISPLAY=wayland-0
+        export GBM_BACKEND=dri
+        export EGL_PLATFORM=drm
+        export MOZ_EGL_USE_DRM=1
+        
+        # Create wayland socket directory
+        mkdir -p /run/user/100000
+        
+        exec /usr/bin/phosh-session
+    " &
+    
+    PHOSH_PID=$!
+    log "Phosh started (PID: $PHOSH_PID)"
+    log "Check logs: /data/.stowaway/kali_native/var/log/phosh-start.log"
+}
+
+do_stop() {
+    log "Stopping phosh..."
+    pkill -f "phosh-session" 2>/dev/null
+    pkill -f "mutter" 2>/dev/null
+    pkill -f "gnome-shell" 2>/dev/null
+    log "Stopped"
+}
+
+do_status() {
+    if pgrep -f "phosh-session" > /dev/null 2>&1; then
+        echo "kali_native Phosh: RUNNING"
+    else
+        echo "kali_native Phosh: NOT RUNNING"
+    fi
+}
+
+case "$1" in
+    start) do_start ;;
+    stop) do_stop ;;
+    status) do_status ;;
+    *) echo "Usage: $0 {start|stop|status}" ;;
+esac

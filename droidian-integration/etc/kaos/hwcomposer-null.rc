@@ -1,0 +1,13 @@
+# Null composer HAL service for the LXC Android container.
+# This RC is bind-mounted over the real vendor composer's RC inside the
+# container so that droid-hal-init starts this stub instead of the real
+# vendor.hwcomposer-2-3.  It must NOT be imported into a normal Android boot.
+# See kaos/hal/hwcomposer-null/ for the matching binary and build wiring.
+service vendor.hwcomposer-2-3 /system/bin/hw/android.hardware.graphics.composer@2.3-service-null
+    interface android.hardware.graphics.composer@2.3::IComposer default
+    class hal animation
+    user system
+    group graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow

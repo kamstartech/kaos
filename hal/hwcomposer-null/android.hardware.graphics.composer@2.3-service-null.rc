@@ -1,0 +1,12 @@
+# Null composer HAL service for the perseus LXC container.
+# This RC is bind-mounted over the real vendor composer's RC inside the
+# container so that droid-hal-init starts this stub instead of the real
+# vendor.hwcomposer-2-3.  It must NOT be imported into a normal Android boot.
+service vendor.hwcomposer-2-3 /system/bin/hw/android.hardware.graphics.composer@2.3-service-null
+    interface android.hardware.graphics.composer@2.3::IComposer default
+    class hal animation
+    user system
+    group graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow

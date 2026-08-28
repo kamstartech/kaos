@@ -1,0 +1,9 @@
+kaos-droidian-integration (0.0.1) trixie; urgency=medium
+
+  * Initial Kaos Droidian integration package.
+  * Port runtime patches from SetupManager.java to build-time files:
+    phosh/hwcomposer BindsTo= overrides, debug logging drop-ins,
+    patched phosh-session wrapper, halium-lxc-exec path override,
+    and hwcomposer-null RC for LXC bind-mount.
+
+ -- Kaos Project <kaos@example.com>  Mon, 25 Aug 2026 00:00:00 +0000

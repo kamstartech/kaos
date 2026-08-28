@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="com.kaos">
+        <!-- System Settings -->
+        <permission name="android.permission.WRITE_SECURE_SETTINGS" />
+        <permission name="android.permission.WRITE_SETTINGS" />
+
+        <!-- Bluetooth Advanced Features -->
+        <permission name="android.permission.BLUETOOTH_PRIVILEGED" />
+
+        <!-- Wi-Fi Advanced Control -->
+        <permission name="android.permission.MANAGE_WIFI_INTERFACES" />
+
+        <!-- Accessibility Services -->
+        <permission name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
+
+        <!-- System Information Access -->
+        <permission name="android.permission.READ_LOGS" />
+        <permission name="android.permission.DUMP" />
+
+        <!-- Audio/Media -->
+        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+
+        <!-- Storage -->
+        <permission name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+        <!-- System Alerts -->
+        <permission name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+        <!-- Multi-user Support -->
+        <permission name="android.permission.INTERACT_ACROSS_USERS" />
+    </privapp-permissions>
+</permissions>

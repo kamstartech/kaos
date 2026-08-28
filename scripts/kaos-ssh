@@ -1,0 +1,10 @@
+#!/system/bin/sh
+# Kaos SSH Environment Wrapper
+# Uses SSH_DEST environment variable because argument passing is broken in the terminal service
+
+DEST=${SSH_DEST:-"root@localhost"}
+
+# Log for debugging
+echo "[$(date)] Connecting to: $DEST" >> /data/local/tmp/nh-ssh.log
+
+exec /product/bin/ssh -p 22 -o StrictHostKeyChecking=no "$DEST"

@@ -1,0 +1,23 @@
+# Hybris override for servicemanager.
+# audioserver and gatekeeperd are not present in hybris adaptations;
+# omitting their onrestart entries prevents indefinite waiting.
+# Uses standard /system/bin/servicemanager binary so this RC is safe
+# in both Android ROM and SailfishOS hybris contexts.
+
+service servicemanager /system/bin/servicemanager
+    override
+    class core animation
+    user system
+    group system readproc
+    critical
+    file /dev/kmsg w
+    onrestart setprop servicemanager.ready false
+    onrestart restart --only-if-running apexd
+    # hybris: audioserver and gatekeeperd are absent in hybris adaptations
+    #onrestart restart audioserver
+    #onrestart restart gatekeeperd
+    onrestart class_restart --only-enabled main
+    onrestart class_restart --only-enabled hal
+    onrestart class_restart --only-enabled early_hal
+    task_profiles ProcessCapacityHigh
+    shutdown critical

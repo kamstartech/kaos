@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    GApps permission allowlist fix for Android 15
+    Fixes bootloop caused by missing privileged permissions
+-->
+<permissions>
+    <!-- Additional GMS permissions for Android 15 -->
+    <privapp-permissions package="com.google.android.gms">
+        <permission name="android.permission.ACTIVITY_EMBEDDING"/>
+        <permission name="android.permission.MANAGE_SUBSCRIPTION_PLANS"/>
+    </privapp-permissions>
+
+    <!-- Google Extension Services permissions -->
+    <privapp-permissions package="com.google.android.ext.services">
+        <permission name="android.permission.PROVIDE_RESOLVER_RANKER_SERVICE"/>
+    </privapp-permissions>
+</permissions>

@@ -1,0 +1,289 @@
+#!/system/bin/sh
+# Kaos Namespace Starter
+# Uses the kaos-bridge (port 30000) to control namespace with root permissions
+# Supports: Multi-distro via --distro flag (HybridOS mode) or official Kali paths
+
+# === Load Distro Library ===
+SCRIPT_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+if [ -f "${SCRIPT_DIR}/distros-lib.sh" ]; then
+    . "${SCRIPT_DIR}/distros-lib.sh"
+elif [ -f "/system/bin/distros-lib.sh" ]; then
+    . /system/bin/distros-lib.sh
+else
+    echo "FATAL: distros-lib.sh not found"
+    exit 1
+fi
+
+# === Parse --distro flag ===
+parse_distro_flag "$@"
+resolve_distro "${_DISTRO_ARG}"
+set -- $_REMAINING_ARGS
+
+BRIDGE_PORT=30000
+BRIDGE_ADDR=127.0.0.1
+INSTALL_DIR="/data/local/kaos_install"
+
+send_command() {
+    echo "$1" | /system/bin/nc $BRIDGE_ADDR $BRIDGE_PORT
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        aarch64)       echo "arm64" ;;
+        armv7l|armv8l) echo "armhf" ;;
+        x86_64)        echo "amd64" ;;
+        i*86)          echo "i386" ;;
+        *)             echo "unknown" ;;
+    esac
+}
+
+do_bootstrap() {
+    TYPE="${1:-minimal}"
+    ARCH=$(detect_arch)
+    
+    if [ "$ARCH" = "unknown" ]; then
+        echo "ERROR: [${DISTRO_NAME}] Unknown architecture: $(uname -m)"
+        exit 1
+    fi
+
+    if [ -z "$DISTRO_URL" ] || [ "$DISTRO_URL" = "local" ]; then
+        echo "ERROR: [${DISTRO_NAME}] No download URL configured. Use bootstrap-local instead."
+        exit 1
+    fi
+
+    # Build download URL based on distro
+    local filename archive_name url
+    case "$DISTRO_NAME" in
+        kali)
+            # Validate type (Kali-specific variants)
+            case "$TYPE" in
+                minimal|nano|full) ;;
+                *)
+                    echo "ERROR: [${DISTRO_NAME}] Invalid type '$TYPE'. Use: minimal, nano, or full"
+                    exit 1
+                    ;;
+            esac
+            filename="kali-nethunter-rootfs-${TYPE}-${ARCH}.tar.xz"
+            url="${DISTRO_URL}/${filename}"
+            archive_name="${DISTRO_NAME}-rootfs.tar.xz"
+            ;;
+        *)
+            # Generic distro — URL from config is the direct download link
+            url="$DISTRO_URL"
+            archive_name="${DISTRO_NAME}-rootfs.${DISTRO_ARCHIVE_FMT}"
+            ;;
+    esac
+    
+    echo "=== ${DISTRO_NAME} Bootstrap ==="
+    echo "Distro: ${DISTRO_NAME}"
+    echo "Architecture: $ARCH"
+    echo "Type: $TYPE"
+    echo "URL: $url"
+    echo ""
+    
+    mkdir -p "$INSTALL_DIR"
+    
+    echo "Downloading rootfs (this may take a while)..."
+    if /system/bin/curl -L -o "${INSTALL_DIR}/${archive_name}" --progress-bar "$url"; then
+        echo ""
+        echo "[${DISTRO_NAME}] Download complete: ${INSTALL_DIR}/${archive_name}"
+        ls -lh "${INSTALL_DIR}/${archive_name}"
+        echo ""
+        echo "Run 'kaos-starter install' to extract the chroot."
+    else
+        echo "ERROR: [${DISTRO_NAME}] Download failed"
+        rm -f "${INSTALL_DIR}/${archive_name}"
+        exit 1
+    fi
+}
+
+do_bootstrap_local() {
+    ARCHIVE_PATH="$1"
+    
+    if [ -z "$ARCHIVE_PATH" ]; then
+        echo "ERROR: [${DISTRO_NAME}] No archive path specified"
+        echo "Usage: kaos-starter [--distro <name>] bootstrap-local /path/to/rootfs.tar.xz"
+        exit 1
+    fi
+    
+    if [ ! -f "$ARCHIVE_PATH" ]; then
+        echo "ERROR: [${DISTRO_NAME}] File not found: $ARCHIVE_PATH"
+        exit 1
+    fi
+
+    local archive_name="${DISTRO_NAME}-rootfs.${DISTRO_ARCHIVE_FMT:-tar.xz}"
+    
+    echo "=== ${DISTRO_NAME} Local Install ==="
+    echo "Distro: ${DISTRO_NAME}"
+    echo "Archive: $ARCHIVE_PATH"
+    echo "Size: $(ls -lh "$ARCHIVE_PATH" | awk '{print $5}')"
+    echo ""
+    
+    mkdir -p "$INSTALL_DIR"
+    
+    if [ "$ARCHIVE_PATH" = "${INSTALL_DIR}/${archive_name}" ]; then
+        echo "[${DISTRO_NAME}] Archive already in install directory."
+    else
+        echo "[${DISTRO_NAME}] Copying archive to install directory..."
+        if cp "$ARCHIVE_PATH" "${INSTALL_DIR}/${archive_name}"; then
+            echo "✓ [${DISTRO_NAME}] Copied to ${INSTALL_DIR}/${archive_name}"
+        else
+            echo "ERROR: [${DISTRO_NAME}] Failed to copy archive"
+            exit 1
+        fi
+    fi
+    
+    echo ""
+    echo "Run 'kaos-starter [--distro ${DISTRO_NAME}] install' to extract the chroot."
+}
+
+# Build --distro passthrough flag for bridge commands
+DISTRO_FLAG=""
+if [ -n "${_DISTRO_ARG}" ]; then
+    DISTRO_FLAG="--distro ${_DISTRO_ARG}"
+fi
+
+case "$1" in
+    start)
+        sleep 3
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} start"
+        ;;
+    exec)
+        shift
+        if [ ! -f "$PID_FILE" ]; then
+            echo "ERROR: [${DISTRO_NAME}] Not running."
+            exit 1
+        fi
+        TARGET_PID=$(cat "$PID_FILE")
+        if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            echo "ERROR: [${DISTRO_NAME}] Stale PID file removed. Namespace is not running."
+            exit 1
+        fi
+        exec runcon u:r:su:s0 /system/bin/busybox_kaos nsenter -t "$TARGET_PID" -m -u -i -p -- /system/bin/chroot "$CHROOT" "$@"
+        ;;
+    login)
+        $0 ${_DISTRO_ARG:+--distro $_DISTRO_ARG} exec "${DISTRO_SHELL:-/bin/bash}" -l
+        ;;
+    stop)
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} stop"
+        ;;
+    restart)
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} stop"
+        sleep 2
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} start"
+        ;;
+    status)
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} status"
+        ;;
+    mounts)
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} mounts"
+        ;;
+    detect)
+        send_command "/system/bin/kaos-service ${DISTRO_FLAG} detect"
+        ;;
+    install)
+        send_command "/system/bin/kaos-chroot-install ${DISTRO_FLAG}"
+        ;;
+    auto-boot)
+        MAX_TRIES=30
+        TRIES=0
+        until send_command "id" | grep -q "uid=0" || [ $TRIES -eq $MAX_TRIES ]; do
+            sleep 1
+            TRIES=$((TRIES + 1))
+        done
+        
+        if [ $TRIES -eq $MAX_TRIES ]; then
+            echo "ERROR: Root bridge not ready after $MAX_TRIES seconds"
+            exit 1
+        fi
+        
+        if [ -z "$_DISTRO_ARG" ]; then
+            # Multi-distro auto-boot: start all with auto_boot=true, or fall back to active distro
+            BOOTED=0
+            for d in $(distro_list); do
+                if [ "$(distro_get "$d" "auto_boot")" = "true" ]; then
+                    echo "Auto-booting: $d"
+                    send_command "/system/bin/kaos-chroot-install --distro $d"
+                    send_command "/system/bin/kaos-service --distro $d start"
+                    BOOTED=1
+                fi
+            done
+            if [ "$BOOTED" = "0" ]; then
+                ACTIVE=$(distro_active)
+                echo "Auto-booting active distro: $ACTIVE"
+                send_command "/system/bin/kaos-chroot-install --distro $ACTIVE"
+                send_command "/system/bin/kaos-service --distro $ACTIVE start"
+            fi
+        else
+            # Single distro override
+            send_command "/system/bin/kaos-chroot-install --distro $_DISTRO_ARG"
+            send_command "/system/bin/kaos-service --distro $_DISTRO_ARG start"
+        fi
+        ;;
+    bootstrap)
+        do_bootstrap "$2"
+        ;;
+    bootstrap-local)
+        do_bootstrap_local "$2"
+        ;;
+    list)
+        echo "=== Installed Distros ==="
+        for d in $(distro_list); do
+            _ls=$(distro_get "$d" "status")
+            _lt=$(distro_get "$d" "type")
+            _la=""
+            [ "$d" = "$(distro_active)" ] && _la=" [ACTIVE]"
+            printf "  %-15s %s (%s)%s\n" "$d" "$_ls" "$_lt" "$_la"
+        done
+        ;;
+    switch)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 switch <distro>"
+            exit 1
+        fi
+        if ! distro_exists "$2"; then
+            echo "ERROR: Unknown distro '$2'. Use '$0 list' to see available distros."
+            exit 1
+        fi
+        resolve_distro "$2"
+        # Update active symlink
+        ln -sfn "${DISTRO_PATH}" "${HYBRIDOS_BASE}/active"
+        echo "Switched active distro to: ${DISTRO_NAME}"
+        ;;
+    *)
+        echo "Kaos Starter - Multi-distro namespace controller"
+        echo ""
+        echo "Usage: $0 [--distro <name>] <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  start              Start namespace for distro"
+        echo "  exec               Run command inside namespace"
+        echo "  login              Login to namespace shell"
+        echo "  stop               Stop namespace"
+        echo "  restart            Restart namespace"
+        echo "  status             Show namespace status"
+        echo "  mounts             Mount chroot filesystems"
+        echo "  detect             Detect and set properties"
+        echo "  install            Install chroot from archive"
+        echo "  list               List all configured distros"
+        echo "  switch <distro>    Set active distro"
+        echo "  bootstrap [type]   Download rootfs"
+        echo "  bootstrap-local <path>  Install from local archive"
+        echo ""
+        echo "Options:"
+        echo "  --distro <name>    Target a specific distro (default: active)"
+        echo ""
+        echo "Active distro: ${DISTRO_NAME} (${DISTRO_MODE} mode)"
+        echo ""
+        echo "Examples:"
+        echo "  $0 start                           # Start active distro"
+        echo "  $0 --distro arch start             # Start Arch Linux"
+        echo "  $0 --distro kali bootstrap nano    # Download Kali nano rootfs"
+        echo "  $0 --distro alpine bootstrap       # Download Alpine rootfs"
+        echo "  $0 list                            # Show all distros"
+        exit 1
+        ;;
+esac
+
+exit 0

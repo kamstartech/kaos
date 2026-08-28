@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare HybridOS runtime for Kali
+After=local-fs.target
+Before=kali-hybridos-verify.service multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kali-hybridos-prepare
+RemainAfterExit=yes
+
+[Install]
+WantedBy=kali-hybridos.target

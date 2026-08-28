@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Prevent Android InputFlinger from reading the kaos-touch uinput device.
+     This device is created by the kaos-touch-input daemon for the Phosh
+     compositor (libinput backend) and should NOT be processed by Android.
+     Without this, EventHub reads events from the device and InputDispatcher
+     cancels real touchscreen events when it detects conflicting pointer streams. -->
+<devices>
+    <device name="kaos-touch" />
+</devices>

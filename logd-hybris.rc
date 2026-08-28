@@ -1,0 +1,15 @@
+# Hybris override for logd.
+# logd SIGABRTs in SFOS because libprocessgroup reads /etc/cgroups.json which
+# is absent (SFOS /etc != Android /system/etc).  liblog handles logd being
+# absent gracefully — all Android log writes become silent no-ops, so HAL
+# services continue to function.  Re-enable once cgroup setup is sorted.
+
+service logd /system/bin/logd
+    override
+    disabled
+    oneshot
+
+service logd-reinit /system/bin/logd --reinit
+    override
+    disabled
+    oneshot

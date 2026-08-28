@@ -1,0 +1,8 @@
+# Per-ABI environment overrides for droid-hybris adaptations (arm64-v8a).
+# Prepends droid-hybris lib paths to LD_LIBRARY_PATH so that Android HAL
+# binaries launched by droid-hal-init can find libhybris shims and
+# alog-compatibility libraries before the stock vendor/system paths.
+# Installed only when HYBRIS_HAL_BUILD=1 (via hadk_perseus.mk).
+
+on init
+    export LD_LIBRARY_PATH /usr/libexec/droid-hybris/lib64-dev-alog:/vendor/lib64:/system/lib64:/usr/libexec/droid-hybris/lib-dev-alog:/vendor/lib:/system/lib

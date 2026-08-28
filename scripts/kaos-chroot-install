@@ -1,0 +1,401 @@
+#!/system/bin/sh
+# Kaos Chroot Installation Script
+# Handles: restore, remove, backup, findchroot, and default auto-install
+# Supports: Multi-distro via distros-lib.sh (HybridOS mode) or official Kali paths
+
+# === Load Distro Library ===
+SCRIPT_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+if [ -f "${SCRIPT_DIR}/distros-lib.sh" ]; then
+    . "${SCRIPT_DIR}/distros-lib.sh"
+elif [ -f "/system/bin/distros-lib.sh" ]; then
+    . /system/bin/distros-lib.sh
+else
+    echo "FATAL: distros-lib.sh not found"
+    exit 1
+fi
+
+# === Parse --distro flag ===
+parse_distro_flag "$@"
+resolve_distro "${_DISTRO_ARG}"
+set -- $_REMAINING_ARGS
+
+# === Configuration (resolved by distros-lib) ===
+DEFAULT_CHROOT_PATH="$REAL_CHROOT"
+DEFAULT_ARCHIVE="/data/local/kaos_install/${DISTRO_NAME}-rootfs.${DISTRO_ARCHIVE_FMT:-tar.xz}"
+INSTALL_LOG="/data/local/tmp/nh_chroot_install.log"
+
+# busybox_kaos is a static multicall binary installed to /system/bin/ by the ROM build.
+# It provides: xzcat, tar, xz, ip, and all other applets needed here.
+BUSYBOX=$(find_busybox)
+if [ -z "$BUSYBOX" ]; then
+    echo "ERROR: [${DISTRO_NAME}] busybox_kaos not found at /system/bin/busybox_kaos"
+    echo "  Ensure the ROM was built with prebuilts/arm64/busybox_kaos present."
+    exit 1
+fi
+
+log() {
+    dlog "$1"
+}
+
+install_kali_boot_wrappers() {
+    [ "$DISTRO_NAME" = "kali" ] || return 0
+    [ -d "$REAL_CHROOT" ] || return 1
+
+    mkdir -p "$REAL_CHROOT/sbin" \
+             "$REAL_CHROOT/usr/local/sbin" \
+             "$REAL_CHROOT/etc/systemd/system/kali-hybridos.target.wants" || return 1
+
+    if [ -f /system/bin/kali-preinit ]; then
+        cp /system/bin/kali-preinit "$REAL_CHROOT/sbin/preinit" || return 1
+        chmod 755 "$REAL_CHROOT/sbin/preinit" || return 1
+    else
+        log "WARNING: /system/bin/kali-preinit not found; boot wrapper not installed"
+    fi
+
+    if [ -f /system/bin/kali-compat-init ]; then
+        cp /system/bin/kali-compat-init "$REAL_CHROOT/usr/local/sbin/kali-compat-init" || return 1
+        chmod 755 "$REAL_CHROOT/usr/local/sbin/kali-compat-init" || return 1
+    else
+        log "WARNING: /system/bin/kali-compat-init not found; compat fallback not installed"
+    fi
+
+    if [ -f /system/bin/kali-hybridos-prepare ]; then
+        cp /system/bin/kali-hybridos-prepare "$REAL_CHROOT/usr/local/sbin/kali-hybridos-prepare" || return 1
+        chmod 755 "$REAL_CHROOT/usr/local/sbin/kali-hybridos-prepare" || return 1
+    else
+        log "WARNING: /system/bin/kali-hybridos-prepare not found"
+    fi
+
+    if [ -f /system/bin/kali-hybridos-verify ]; then
+        cp /system/bin/kali-hybridos-verify "$REAL_CHROOT/usr/local/sbin/kali-hybridos-verify" || return 1
+        chmod 755 "$REAL_CHROOT/usr/local/sbin/kali-hybridos-verify" || return 1
+    else
+        log "WARNING: /system/bin/kali-hybridos-verify not found"
+    fi
+
+    for unit in kali-hybridos.target kali-hybridos-prepare.service kali-hybridos-verify.service; do
+        src="/system/etc/kaos/systemd/$unit"
+        dst="$REAL_CHROOT/etc/systemd/system/$unit"
+        if [ -f "$src" ]; then
+            cp "$src" "$dst" || return 1
+            chmod 644 "$dst" || return 1
+        else
+            log "WARNING: $src not found"
+        fi
+    done
+
+    ln -sfn /etc/systemd/system/kali-hybridos-prepare.service \
+        "$REAL_CHROOT/etc/systemd/system/kali-hybridos.target.wants/kali-hybridos-prepare.service" || return 1
+    ln -sfn /etc/systemd/system/kali-hybridos-verify.service \
+        "$REAL_CHROOT/etc/systemd/system/kali-hybridos.target.wants/kali-hybridos-verify.service" || return 1
+
+    log "✓ Kali boot wrappers installed"
+}
+
+do_restore() {
+    ARCHIVE="$1"
+    CHROOT_DIR="$2"
+
+    if [ -z "$ARCHIVE" ] || [ -z "$CHROOT_DIR" ]; then
+        log "Usage: restore <archive_path> <chroot_path>"
+        exit 1
+    fi
+
+    if [ ! -f "$ARCHIVE" ]; then
+        log "✗ Archive not found: $ARCHIVE"
+        exit 1
+    fi
+
+    # Resolve to the real chroot directory
+    # In official NH mode: app sends kalifs path, real data is at kali-arm64
+    # In HybridOS mode: paths are resolved by distros-lib
+    EXTRACT_DIR=$(dirname "$CHROOT_DIR")
+    REAL_DIR="${REAL_CHROOT}"
+    mkdir -p "$EXTRACT_DIR"
+
+    # Clean existing chroot (unmount first, then remove real dir)
+    if grep -qs "$CHROOT_DIR " /proc/mounts; then
+        for mount in sdcard system vendor dev/dri dev/shm dev/pts dev proc sys; do
+            umount -l "$CHROOT_DIR/$mount" 2>/dev/null
+        done
+        umount -l "$CHROOT_DIR" 2>/dev/null
+    fi
+    if [ -d "$REAL_DIR" ]; then
+        log "Cleaning existing chroot at $REAL_DIR..."
+        for mount in sdcard system vendor dev/dri dev/shm dev/pts dev proc sys; do
+            umount -l "$REAL_DIR/$mount" 2>/dev/null
+        done
+        rm -rf "$REAL_DIR"
+    fi
+
+    log "Extracting $ARCHIVE to $EXTRACT_DIR..."
+    log "Archive size: $(ls -lh "$ARCHIVE" | awk '{print $5}')"
+    cd "$EXTRACT_DIR"
+
+    # Detect compression and extract via busybox_kaos applets.
+    # Use a temp FIFO so we can capture the exit code of the decompressor
+    # independently — a bare pipe masks the left-hand exit code in sh.
+    EXTRACT_OK=0
+    case "$ARCHIVE" in
+        *.tar.xz)
+            $BUSYBOX xzcat "$ARCHIVE" 2>>"$INSTALL_LOG" | $BUSYBOX tar xf - 2>>"$INSTALL_LOG"
+            EXTRACT_OK=$?
+            ;;
+        *.tar.gz|*.tgz)
+            $BUSYBOX zcat "$ARCHIVE" 2>>"$INSTALL_LOG" | $BUSYBOX tar xf - 2>>"$INSTALL_LOG"
+            EXTRACT_OK=$?
+            ;;
+        *.tar)
+            $BUSYBOX tar xf "$ARCHIVE" 2>>"$INSTALL_LOG"
+            EXTRACT_OK=$?
+            ;;
+        *)
+            $BUSYBOX xzcat "$ARCHIVE" 2>/dev/null | $BUSYBOX tar xf - 2>>"$INSTALL_LOG"
+            EXTRACT_OK=$?
+            if [ $EXTRACT_OK -ne 0 ]; then
+                $BUSYBOX zcat "$ARCHIVE" 2>/dev/null | $BUSYBOX tar xf - 2>>"$INSTALL_LOG"
+                EXTRACT_OK=$?
+            fi
+            ;;
+    esac
+    if [ $EXTRACT_OK -ne 0 ]; then
+        log "✗ Extraction command failed (exit $EXTRACT_OK) — check $INSTALL_LOG"
+        exit 1
+    fi
+
+    # Find what was extracted — search for any valid rootfs directory
+    FOUND_DIR=""
+    # First check the expected distro path
+    if [ -d "$REAL_DIR" ] && { [ -f "$REAL_DIR/etc/os-release" ] || [ -f "$REAL_DIR/etc/debian_version" ]; }; then
+        FOUND_DIR="$REAL_DIR"
+    else
+        # Search for extracted rootfs directory — prefer candidates matching distro name
+        DISTRO_BASE=$(echo "$DISTRO_NAME" | tr '[:upper:]' '[:lower:]')
+        for candidate in "$EXTRACT_DIR"/${DISTRO_BASE}-arm64 "$EXTRACT_DIR"/${DISTRO_BASE}-armhf "$EXTRACT_DIR"/${DISTRO_BASE}-aarch64 \
+                         "$EXTRACT_DIR"/*-arm64 "$EXTRACT_DIR"/*-armhf "$EXTRACT_DIR"/*-aarch64 \
+                         "$EXTRACT_DIR"/chroot "$EXTRACT_DIR"/rootfs "$EXTRACT_DIR"/system; do
+            if [ -d "$candidate" ] && { [ -f "$candidate/etc/os-release" ] || [ -f "$candidate/etc/debian_version" ]; }; then
+                FOUND_DIR="$candidate"
+                break
+            fi
+        done
+    fi
+
+    # Handle flat tarballs (e.g. Alpine minirootfs) that extract their files
+    # directly into EXTRACT_DIR without a wrapper subdirectory.
+    if [ -z "$FOUND_DIR" ] && { [ -f "$EXTRACT_DIR/etc/os-release" ] || [ -f "$EXTRACT_DIR/etc/debian_version" ]; }; then
+        log "Flat tarball detected — relocating files into $REAL_DIR"
+        mkdir -p "$REAL_DIR"
+        # Move standard rootfs directories into the distro subdir
+        for entry in "$EXTRACT_DIR"/*; do
+            name=$(basename "$entry")
+            # Skip stowaway metadata (distros.conf, active symlink, other distro dirs)
+            case "$name" in
+                distros.conf|active) continue ;;
+            esac
+            # Skip if this entry is another distro's directory
+            if [ -d "$entry" ] && [ -f "$EXTRACT_DIR/distros.conf" ]; then
+                if grep -q "^\[$name\]" "$EXTRACT_DIR/distros.conf" 2>/dev/null; then
+                    continue
+                fi
+            fi
+            # Skip REAL_DIR itself
+            [ "$entry" = "$REAL_DIR" ] && continue
+            mv "$entry" "$REAL_DIR/" 2>/dev/null
+        done
+        FOUND_DIR="$REAL_DIR"
+    fi
+
+    # Rename to match REAL_CHROOT (distros.conf path=) if the archive extracted
+    # under a different name (e.g. kali-arm64 vs kali).
+    if [ -n "$FOUND_DIR" ] && [ "$FOUND_DIR" != "$REAL_DIR" ]; then
+        log "Renaming $FOUND_DIR → $REAL_DIR to match distros.conf path"
+        mv "$FOUND_DIR" "$REAL_DIR" || { log "ERROR: failed to rename extracted dir"; exit 1; }
+        FOUND_DIR="$REAL_DIR"
+    fi
+
+    if [ -z "$FOUND_DIR" ]; then
+        log "✗ Extraction failed — no valid chroot directory found"
+        exit 1
+    fi
+
+    log "✓ Chroot extracted to $FOUND_DIR"
+    chmod 755 "$FOUND_DIR"
+    for dir in dev proc sys tmp; do
+        mkdir -p "$FOUND_DIR/$dir"
+    done
+    # DNS
+    cat > "$FOUND_DIR/etc/resolv.conf" << 'DNSEOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+DNSEOF
+    echo "${DISTRO_HOSTNAME}" > "$FOUND_DIR/etc/hostname"
+
+    install_kali_boot_wrappers || {
+        log "ERROR: failed to install Kali boot wrappers"
+        exit 1
+    }
+
+    log "✓ ${DISTRO_NAME} chroot installation complete"
+    log "Real chroot: $FOUND_DIR"
+    log "Service will bind-mount to $CHROOT_DIR on start"
+
+    # Ensure the mount point directory exists for kaos-service
+    [ ! -d "$CHROOT_DIR" ] && mkdir -p "$CHROOT_DIR"
+
+    exit 0
+}
+
+do_remove() {
+    CHROOT_DIR="$1"
+    if [ -z "$CHROOT_DIR" ]; then
+        log "Usage: remove <chroot_path>"
+        exit 1
+    fi
+
+    EXTRACT_DIR=$(dirname "$CHROOT_DIR")
+    REAL_DIR="${REAL_CHROOT}"
+
+    # Unmount the mount point but keep the directory
+    if grep -qs "$CHROOT_DIR " /proc/mounts; then
+        log "Unmounting bind mount at $CHROOT_DIR..."
+        for mount in sdcard system vendor dev/dri dev/shm dev/pts dev proc sys; do
+            umount -l "$CHROOT_DIR/$mount" 2>/dev/null
+        done
+        umount -l "$CHROOT_DIR" 2>/dev/null
+    fi
+
+    # Remove the real chroot directory, not the mount point
+    if [ -d "$REAL_DIR" ]; then
+        log "Removing real chroot at $REAL_DIR..."
+        for mount in sdcard system vendor dev/dri dev/shm dev/pts dev proc sys; do
+            umount -l "$REAL_DIR/$mount" 2>/dev/null
+        done
+        rm -rf "$REAL_DIR"
+    fi
+
+    log "✓ Chroot removed"
+    exit 0
+}
+
+do_backup() {
+    BACKUP_PATH="$1"
+    CHROOT_DIR="$2"
+    if [ -z "$BACKUP_PATH" ] || [ -z "$CHROOT_DIR" ]; then
+        log "Usage: backup <output_path> <chroot_path>"
+        exit 1
+    fi
+
+    # Resolve to real chroot dir
+    EXTRACT_DIR=$(dirname "$CHROOT_DIR")
+    if [ -d "$REAL_CHROOT" ]; then
+        CHROOT_DIR="$REAL_CHROOT"
+    fi
+
+    if [ ! -d "$CHROOT_DIR" ]; then
+        log "✗ Chroot not found at $CHROOT_DIR"
+        exit 1
+    fi
+
+    log "Backing up $CHROOT_DIR to $BACKUP_PATH..."
+    BACKUP_DIR=$(dirname "$BACKUP_PATH")
+    mkdir -p "$BACKUP_DIR"
+
+    cd "$(dirname "$CHROOT_DIR")"
+    FOLDER_NAME=$(basename "$CHROOT_DIR")
+
+    if $BUSYBOX tar cf - "$FOLDER_NAME" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' 2>>"$INSTALL_LOG" | \
+       $BUSYBOX xz -c > "$BACKUP_PATH" 2>>"$INSTALL_LOG"; then
+        log "✓ Backup complete: $BACKUP_PATH"
+        ls -lh "$BACKUP_PATH"
+        exit 0
+    else
+        log "✗ Backup failed"
+        rm -f "$BACKUP_PATH"
+        exit 1
+    fi
+}
+
+do_findchroot() {
+    # Search for valid chroot directories in both official NH and HybridOS locations
+    local search_dirs=""
+    if [ "$DISTRO_MODE" = "hybridos" ]; then
+        search_dirs="${HYBRIDOS_BASE} ${HYBRIDOS_MOUNT}"
+    else
+        search_dirs="${OFFICIAL_NH_BASE}"
+    fi
+
+    for base in $search_dirs; do
+        for dir in "$base"/*; do
+            if [ -d "$dir" ] && { [ -f "$dir/etc/os-release" ] || [ -f "$dir/etc/debian_version" ]; }; then
+                echo "$dir"
+            fi
+        done
+    done
+    exit 0
+}
+
+do_auto_install() {
+    # Default auto-install: extract from archive path (used by init/boot)
+    CHROOT_PATH="$DEFAULT_CHROOT_PATH"
+    CHROOT_ARCHIVE="$DEFAULT_ARCHIVE"
+    local shell_name=$(basename "${DISTRO_SHELL:-/bin/bash}")
+
+    if [ -d "$CHROOT_PATH" ] && [ -f "$CHROOT_PATH/etc/os-release" ] && [ -f "$CHROOT_PATH/bin/$shell_name" ]; then
+        install_kali_boot_wrappers || {
+            log "ERROR: failed to refresh Kali boot wrappers"
+            exit 1
+        }
+        log "${DISTRO_NAME} chroot already installed at $CHROOT_PATH"
+        [ -f "$CHROOT_ARCHIVE" ] && rm -f "$CHROOT_ARCHIVE" && log "Cleaned up archive."
+        exit 0
+    fi
+
+    if [ ! -f "$CHROOT_ARCHIVE" ]; then
+        log "${DISTRO_NAME} chroot archive not found at $CHROOT_ARCHIVE"
+        exit 0
+    fi
+
+    do_restore "$CHROOT_ARCHIVE" "$CHROOT_PATH"
+}
+
+# Parse arguments
+# App calls: kaos-chroot-install -c "restore <archive> <chroot>"
+#             kaos-chroot-install -c "remove <chroot>"
+#             kaos-chroot-install -c "backup <output> <chroot>"
+#             kaos-chroot-install -c "findchroot"
+# Boot calls: kaos-chroot-install (no args)
+
+if [ "$1" = "-c" ]; then
+    # After parse_distro_flag + "set -- $_REMAINING_ARGS", the quoted argument
+    # "-c 'restore path1 path2'" has been word-split into separate positionals:
+    #   $1 = -c   $2 = restore   $3 = path1   $4 = path2
+    # Do NOT awk-parse $2 as a space-separated string — it is already just the
+    # sub-command name. Read args directly from positional parameters.
+    CMD="$2"
+    ARG1="$3"
+    ARG2="$4"
+
+    case "$CMD" in
+        restore)
+            do_restore "$ARG1" "$ARG2"
+            ;;
+        remove)
+            do_remove "$ARG1"
+            ;;
+        backup)
+            do_backup "$ARG1" "$ARG2"
+            ;;
+        findchroot)
+            do_findchroot
+            ;;
+        *)
+            log "Unknown command: $CMD"
+            echo "Usage: $0 -c \"<restore|remove|backup|findchroot> [args...]\""
+            exit 1
+            ;;
+    esac
+else
+    # No args — auto-install from default archive
+    do_auto_install
+fi

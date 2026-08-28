@@ -1,0 +1,54 @@
+#!/system/bin/sh
+# Kaos Phosh Launcher
+# Uses the root bridge (port 30000) to start Phosh in kali namespace
+# This is more reliable than direct chroot
+
+BRIDGE_PORT=30000
+DISTRO="kali"
+LOG="/data/.stowaway/kali/var/log/phosh-start.log"
+
+log() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"
+}
+
+send_cmd() {
+    echo "$1" | nc 127.0.0.1 $BRIDGE_PORT
+}
+
+do_start() {
+    log "=== Starting Phosh in kali namespace ==="
+    
+    # Check if kali is active
+    STATUS=$(send_cmd "/system/bin/kaos-starter --distro $DISTRO status")
+    log "Status: $STATUS"
+    
+    if ! echo "$STATUS" | grep -q "Active"; then
+        log "Kali not active, cannot start phosh"
+        return 1
+    fi
+    
+    log "Starting phosh-session..."
+    
+    # Start phosh in kali namespace
+    send_cmd "mkdir -p /run/user/100000 && chown 100000:100000 /run/user/100000 && chmod 700 /run/user/100000 && /usr/bin/phosh-session" &
+    
+    log "Phosh started (background)"
+    log "Check status: kaos-phosh status"
+}
+
+do_stop() {
+    log "Stopping phosh..."
+    send_cmd "pkill -9 phosh-session; pkill -9 mutter; pkill -9 gnome-shell"
+    log "Stopped"
+}
+
+do_status() {
+    send_cmd "ps aux | grep -E 'phosh|mutter' | grep -v grep"
+}
+
+case "$1" in
+    start) do_start ;;
+    stop) do_stop ;;
+    status) do_status ;;
+    *) echo "Usage: $0 {start|stop|status}" ;;
+esac

@@ -1,0 +1,125 @@
+#!/system/bin/sh
+# Kali Native — Namespace Launcher
+# Uses the kaos-bridge to start kali_native in a namespace with Phosh
+
+DISTRO="kali_native"
+STOWAWAY="/data/.stowaway"
+CHROOT="$STOWAWAY/$DISTRO"
+BRIDGE_PORT=30000
+LOG="$CHROOT/var/log/native-start.log"
+
+log() {
+    echo "[$(date +%H:%M:%S)] [kali-native] $*" 
+    echo "[$(date +%H:%M:%S)] [kali-native] $*" >> "$LOG" 2>/dev/null
+}
+
+check_rootfs() {
+    if [ ! -d "$CHROOT" ]; then
+        log "ERROR: $CHROOT not found"
+        return 1
+    fi
+    if [ ! -x "$CHROOT/usr/bin/phosh-session" ]; then
+        log "ERROR: phosh-session not found"
+        return 1
+    fi
+    return 0
+}
+
+do_mounts() {
+    log "Setting up mounts..."
+    
+    # Bind mount Android partitions
+    for mnt in /system /vendor /product /system_ext /odm /linkerconfig; do
+        dst="$CHROOT$mnt"
+        [ -d "$mnt" ] && [ ! -d "$dst" ] && mkdir -p "$dst"
+        if [ -d "$mnt" ] && [ -d "$dst" ]; then
+            mount --bind "$mnt" "$dst" 2>/dev/null
+        fi
+    done
+    
+    # tmpfs mounts
+    for tmp in proc sys dev run tmp; do
+        dst="$CHROOT/$tmp"
+        [ ! -d "$dst" ] && mkdir -p "$dst"
+        case "$tmp" in
+            proc) mount -t proc proc "$dst" 2>/dev/null ;;
+            sys) mount -t sysfs sysfs "$dst" 2>/dev/null ;;
+            dev) mount -t devtmpfs devtmpfs "$dst" 2>/dev/null ;;
+            run|tmp) mount -t tmpfs tmpfs "$dst" 2>/dev/null ;;
+        esac
+    done
+    
+    # User runtime
+    mkdir -p "$CHROOT/run/user/100000"
+    chown 100000:100000 "$CHROOT/run/user/100000" 2>/dev/null
+    chmod 700 "$CHROOT/run/user/100000" 2>/dev/null
+    
+    log "Mounts complete"
+}
+
+do_start_phosh() {
+    log "=== Starting Kali Native Phosh ==="
+    
+    check_rootfs || return 1
+    do_mounts
+    
+    KERNEL_MAJOR="$(uname -r | cut -d. -f1)"
+    log "Kernel: $KERNEL_MAJOR"
+    
+    # Set environment
+    export XDG_CURRENT_DESKTOP=Phosh:GNOME
+    export XDG_SESSION_TYPE=wayland
+    export WAYLAND_DISPLAY=wayland-0
+    export GDK_BACKEND=wayland
+    
+    log "Starting phosh-session for user kali..."
+    
+    # Start phosh in background as kali user
+    chroot "$CHROOT" /bin/su - kali -c "export XDG_CURRENT_DESKTOP=Phosh:GNOME && export XDG_SESSION_TYPE=wayland && export WAYLAND_DISPLAY=wayland-0 && /usr/bin/phosh-session" &
+    
+    PHOSH_PID=$!
+    log "Phosh started (PID: $PHOSH_PID)"
+    
+    log "=== Kali Native Phosh Ready ==="
+    log "Connect via: kaos-starter --distro $DISTRO exec /bin/bash"
+}
+
+do_start_cli() {
+    log "=== Starting Kali Native CLI ==="
+    
+    check_rootfs || return 1
+    do_mounts
+    
+    log "Starting shell for user kali..."
+    
+    # Start shell
+    chroot "$CHROOT" /bin/su - kali &
+    
+    log "=== Kali Native CLI Ready ==="
+}
+
+case "$1" in
+    start)
+        if [ "$2" = "cli" ]; then
+            do_start_cli
+        else
+            do_start_phosh
+        fi
+        ;;
+    stop)
+        log "Stopping..."
+        pkill -f "phosh-session" 2>/dev/null
+        log "Stopped"
+        ;;
+    status)
+        if pgrep -f "phosh-session" > /dev/null 2>&1; then
+            echo "kali_native: RUNNING"
+        else
+            echo "kali_native: NOT RUNNING"
+        fi
+        ;;
+    *) 
+        echo "Kali Native Launcher"
+        echo "Usage: $0 {start|start cli|stop|status}"
+        ;;
+esac

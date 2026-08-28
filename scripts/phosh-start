@@ -1,0 +1,26 @@
+#!/system/bin/sh
+# Phosh Start Script - Direct execution via namespace
+# Usage: phosh-start
+
+log() {
+    echo "[$(date +%H:%M:%S)] $*" 
+}
+
+DISTRO="kali"
+
+# Check if distro is active via bridge
+STATUS=$(echo "/system/bin/kaos-starter --distro $DISTRO status" | nc 127.0.0.1 30000)
+log "Status: $STATUS"
+
+if ! echo "$STATUS" | grep -q "Active"; then
+    log "ERROR: $DISTRO not active"
+    exit 1
+fi
+
+log "Starting phosh..."
+
+# Execute in namespace
+echo "/system/bin/kaos-starter --distro $DISTRO exec /usr/bin/phosh-session" | nc 127.0.0.1 30000 &
+
+log "Started phosh (check with: ps aux | grep phosh)"
+log "Note: Display output goes to device screen"

@@ -1,0 +1,22 @@
+# Hybris display HAL SELinux policy
+#
+# Under droid-hal-init, vendor HAL processes (hwcomposer, display color, etc.)
+# inherit the init domain because no exec-transition is configured for hybris.
+# display.qservice is registered with the standard servicemanager (not
+# vndservicemanager), so it gets the default_android_service label rather than
+# vendor_qdisplay_service. Allow init to add and find it.
+#
+# default_android_service is a platform-public type; this rule is vendor-policy
+# safe on sdm845 (shipped API 28, pre-strict-Treble).
+#
+# REMOVED: This rule violates two platform neverallows:
+#   1. init.te:829  -> neverallow init service_manager_type:service_manager { add find };
+#   2. domain.te:771 -> neverallow * default_android_service:service_manager *;
+# These are hard security boundaries in Android — init must not register binder
+# services, and no domain may use the generic default_android_service label.
+#
+# Because androidboot.selinux=permissive is already set, the display HAL will
+# still function (AVCs are logged but not enforced). The proper long-term fix
+# is to run the display HAL in its own domain (exec transition) and register
+# the service with vndservicemanager so it gets a vendor-specific label.
+#allow init default_android_service:service_manager { add find };

@@ -1,0 +1,34 @@
+# Hybris override for apexd services.
+# Redirects apexd to the droid-hybris overlay binary path and removes the
+# forced-reboot-on-failure so that SailfishOS shutdown works correctly.
+# Installed only when HYBRIS_HAL_BUILD=1 (via hadk_perseus.mk).
+
+service apexd /system/bin/apexd
+    override
+    interface aidl apexservice
+    class core
+    user root
+    group system
+    oneshot
+    disabled # does not start with the core class
+    # reboot_on_failure removed: breaks SailfishOS shutdown and is unnecessary
+    # on dev/hybris builds with an unlocked bootloader.
+    capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SYS_ADMIN
+
+service apexd-bootstrap /system/bin/apexd --bootstrap
+    override
+    user root
+    group system
+    oneshot
+    disabled
+    # reboot_on_failure removed: droid-hal-init holds CAP_SYS_BOOT and would
+    # hard-reboot the entire SailfishOS session on any apexd failure.
+    capabilities SYS_ADMIN
+
+service apexd-snapshotde /system/bin/apexd --snapshotde
+    override
+    user root
+    group system
+    oneshot
+    disabled
+    capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER

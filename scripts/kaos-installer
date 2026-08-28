@@ -1,0 +1,6 @@
+#!/system/bin/sh
+# Kaos Main Installer Wrapper
+# This script is a wrapper for kaos-chroot-install to provide a consistent interface
+# for both the Android app and CLI users.
+
+/system/bin/kaos-chroot-install "$@"

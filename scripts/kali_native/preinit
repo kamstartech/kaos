@@ -1,0 +1,99 @@
+#!/bin/bash
+# Kali Native — Pre-init with Phoc DRM Display
+
+exec >> >(tee -a /var/log/preinit.log) 2>&1
+
+echo "=== Kali Native preinit START PID=$$ ==="
+date
+
+echo "=== Phase 1: Mounts ==="
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true  
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+echo "Phase 1: OK"
+
+echo "=== Phase 2: Device nodes ==="
+for n in null zero urandom random console tty; do
+    [ -e /dev/$n ] || mknod -m 666 /dev/$n c 1 3 2>/dev/null
+done
+echo "Phase 2: OK"
+
+echo "=== Phase 3: Environment ==="
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+hostname kali-native 2>/dev/null || true
+echo "Phase 3: OK"
+
+echo "=== Phase 4: Android Mounts ==="
+mkdir -p /system /vendor
+mount -t ext4 -o ro /dev/block/by-name/system /system 2>/dev/null || true
+mount -t ext4 -o ro /dev/block/by-name/vendor /vendor 2>/dev/null || true
+ls -la /system /vendor 2>/dev/null || true
+echo "Phase 4: OK"
+
+echo "=== Phase 5: DRM ==="
+mkdir -p /dev/dri
+ls -la /dev/dri/ 2>/dev/null || true
+echo "Phase 5: OK"
+
+echo "=== Phase 6: Cgroups ==="
+mount -t tmpfs tmpfs /sys/fs/cgroup -o mode=0755 2>/dev/null || true
+mkdir -p /sys/fs/cgroup/cpu /sys/fs/cgroup/memory
+mount -t cgroup none /sys/fs/cgroup/cpu -o cpu,cpuacct 2>/dev/null || true
+mount -t cgroup none /sys/fs/cgroup/memory -o memory 2>/dev/null || true
+echo "Phase 6: OK"
+
+echo "=== Phase 7: User runtime ==="
+mkdir -p /run/user/100000
+chown 100000:100000 /run/user/100000 2>/dev/null || true
+chmod 700 /run/user/100000 2>/dev/null || true
+ls -la /run/user/ 2>/dev/null || true
+echo "Phase 7: OK"
+
+echo "=== Phase 8: systemd + phoc ==="
+export XDG_RUNTIME_DIR=/run/user/100000
+export GBM_BACKEND=dri
+export EGL_PLATFORM=drm
+export WAYLAND_DISPLAY=wayland-0
+export MOZ_EGL_USE_DRM=1
+
+KERNEL_MAJOR=$(uname -r | cut -d. -f1)
+echo "Kernel: $KERNEL_MAJOR"
+
+for p in /lib/systemd/systemd /usr/lib/systemd/systemd /lib64/systemd/systemd; do
+    if [ -x "$p" ]; then
+        echo "Found systemd: $p"
+        
+        # Start systemd in background
+        echo "=== Starting systemd ==="
+        date
+        $p --unit=multi-user.target --system &
+        SYSTEMD_PID=$!
+        echo "systemd started (PID: $SYSTEMD_PID)"
+        
+        # Wait for systemd to initialize
+        sleep 3
+        
+        # Start phoc
+        echo "=== Starting phoc ==="
+        sleep 2
+        
+        # Try start phoc 
+        /usr/local/bin/start-phoc &
+        PHOC_PID=$!
+        echo "phoc started (PID: $PHOC_PID)"
+        
+        echo "=== Kali Native ready ==="
+        echo "Display should be on screen now"
+        
+        # Keep running
+        wait
+    fi
+done
+
+echo "=== Fallback: shell ==="
+exec /bin/bash -i

@@ -1,0 +1,25 @@
+// Kaos project-level, device-agnostic source tree (project rebrand from
+// "HybridOS" -- see kaos/hal/, kaos/apps/). Parallel to device/, hardware/,
+// system/ etc. at the repo root -- content here is OS/Halium architecture,
+// not tied to any specific device tree.  device-specific wiring
+// (nethunter.mk PRODUCT_PACKAGES/PRODUCT_COPY_FILES, sepolicy file_contexts,
+// LXC container mount hooks) still lives under the relevant
+// device/<vendor>/<name>/ tree and references modules built from here.
+//
+// Layout:
+//   kaos/hal/<name>/   native HAL services (e.g. hwcomposer-null)
+//   kaos/apps/<name>/  full apps (e.g. phosh-app)
+
+soong_namespace {
+}
+
+// Android-Apache-2.0 (build/soong/licenses/Android.bp) is genuinely
+// "//visibility:public" -- unlike e.g. hardware_interfaces_license, which is
+// scoped to ":__subpackages__" of hardware/interfaces/ and is NOT usable
+// from an external tree like this one (confirmed via a real build failure:
+// "depends on //hardware/interfaces:hardware_interfaces_license which is
+// not visible to this module"). Every module under kaos/ inherits this
+// unless it declares its own package{} block.
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}

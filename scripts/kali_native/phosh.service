@@ -1,0 +1,26 @@
+[Unit]
+Description=Phosh, a shell for mobile phones
+Documentation=https://gitlab.gnome.org/World/Phosh/phosh
+Conflicts=getty@tty1.service
+After=getty@tty1.service rc-local.service plymouth-quit-wait.service systemd-user-sessions.service
+OnFailure=getty@tty1.service
+Wants=dbus.socket
+After=dbus.socket
+Before=graphical.target
+
+[Service]
+Environment=LANG=C.UTF-8
+Environment=XDG_CURRENT_DESKTOP=Phosh:GNOME
+Environment=XDG_SESSION_DESKTOP=phosh
+Environment=XDG_SESSION_TYPE=wayland
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/phosh-session
+TimeoutStartSec=60
+User=100000
+PAMName=login
+WorkingDirectory=/home/kali
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,12 @@
+#!/system/bin/sh
+# Kaos Root Bridge
+# Listens on port 30000 and provides a root shell interface
+
+PORT=30000
+ADDR=127.0.0.1
+
+# Loop to keep the bridge alive — toybox nc -L may exit after connections
+while true; do
+    /system/bin/nc -L -p $PORT -s $ADDR /system/bin/sh -l
+    sleep 1
+done
