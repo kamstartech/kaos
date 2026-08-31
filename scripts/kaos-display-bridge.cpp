@@ -126,7 +126,16 @@ static const char *FRAGMENT_SHADER_SRC =
     "varying vec2 vTexCoord;\n"
     "uniform sampler2D uTexture;\n"
     "void main() {\n"
-    "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
+    // Force alpha=1.0 rather than passing through the captured frame's own
+    // alpha channel -- confirmed live 2026-08-28: phoc's headless output
+    // doesn't populate a meaningful per-pixel alpha (a screen capture has
+    // no reason to), so honoring it made the whole layer composite as
+    // fully transparent even with the *layer's* own alpha at 1.0 (CMD_SHOW
+    // processed correctly, "Surface SHOWN" logged, screenshot still showed
+    // nothing -- SurfaceFlinger blends using the buffer's real per-pixel
+    // alpha regardless of the layer-level alpha being set to opaque). A
+    // captured screen output should always be treated as fully opaque.
+    "    gl_FragColor = vec4(texture2D(uTexture, vTexCoord).rgb, 1.0);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src) {

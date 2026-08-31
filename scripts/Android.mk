@@ -44,3 +44,4 @@ LOCAL_MODULE_CLASS      := EXECUTABLES
 LOCAL_SRC_FILES         := kaos.c
 LOCAL_CFLAGS            := -Wall -Werror
 include $(BUILD_EXECUTABLE)
+

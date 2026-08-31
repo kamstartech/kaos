@@ -42,7 +42,7 @@ do_mounts() {
 
     # 0. Nuclear Cleanup: Forcibly unmount everything to ensure a clean state
     # We use -l (lazy) to handle busy filesystems safely
-    for m in system_root mnt/vendor/persist vendor/bt_firmware vendor/dsp vendor/firmware_mnt \
+    for m in system_root mnt/vendor/persist mnt/android-dev-socket mnt/android-dev-snd vendor/bt_firmware vendor/dsp vendor/firmware_mnt \
              system vendor sdcard dev/dri dev/pts dev proc ""; do
         umount -l "$CHROOT/$m" 2>/dev/null
     done
@@ -88,6 +88,35 @@ do_mounts() {
             runcon u:r:su:s0 mount -o bind "/$m" "$CHROOT/$m" 2>/dev/null
         fi
     done
+
+    # Second bind of the same /dev/socket, at a path outside both /dev and
+    # /run -- ns-entry.sh remounts both of those fresh (private tmpfs) once
+    # inside the namespace, which shadows the bind above the same way it
+    # would shadow a plain file. The previous fix for this (cd into
+    # $CHROOT/dev/socket to pin the dentry via the shell's cwd, then
+    # "mount --bind /proc/self/cwd /dev/socket" after the remount) does NOT
+    # actually work -- confirmed live 2026-08-28: /proc/self/cwd itself
+    # still resolves to the real, pinned content right up to that mount
+    # call (a plain `ls -la /proc/self/cwd/` after the remount shows it),
+    # but binding *from* that magic symlink as the mount source silently
+    # produces an empty result rather than carrying the pinned content
+    # through, despite the mount command itself reporting success. This
+    # path is never touched by anything ns-entry.sh does, so a plain
+    # symlink to it (see ns-entry.sh's Phase 1) survives the /dev remount
+    # with no such fragility.
+    [ ! -d "$CHROOT/mnt/android-dev-socket" ] && mkdir -p "$CHROOT/mnt/android-dev-socket"
+    if ! grep -qs "$CHROOT/mnt/android-dev-socket " /proc/mounts; then
+        runcon u:r:su:s0 mount -o bind /dev/socket "$CHROOT/mnt/android-dev-socket" 2>/dev/null
+    fi
+
+    # /dev/snd is needed by Linux audio stacks (ALSA/PipeWire). Same bind-twice
+    # trick as /dev/socket: ns-entry.sh remounts /dev as a private tmpfs, which
+    # shadows the direct bind, so keep a second bind at a path nothing inside
+    # the namespace touches and symlink to it from the fresh /dev.
+    [ ! -d "$CHROOT/mnt/android-dev-snd" ] && mkdir -p "$CHROOT/mnt/android-dev-snd"
+    if ! grep -qs "$CHROOT/mnt/android-dev-snd " /proc/mounts; then
+        runcon u:r:su:s0 mount -o bind /dev/snd "$CHROOT/mnt/android-dev-snd" 2>/dev/null
+    fi
 
     # SailfishOS needs firmware paths bind-mounted from Android host
     if [ -f "$REAL_CHROOT/etc/os-release" ] && grep -q 'sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null; then
@@ -240,35 +269,87 @@ start_namespace() {
 [Unit]
 # Remove VT/tty conditions — we run in a namespace without real VTs
 ConditionPathExists=
+# The base unit only orders after dbus.socket, not systemd-logind.service
+# itself -- confirmed live 2026-08-29: with only dbus.socket ordering,
+# phosh.service can start racing logind's own startup (it preallocates
+# VTs and sets up seat0 asynchronously), so phoc's PAM session sometimes
+# opens before logind is actually ready to register it -- logind's own
+# journal showed zero "New session ... of user phosh" lines for the whole
+# boot in the broken case, versus a handful early in a boot where it
+# happened to win the race. systemd-logind.service is Type=notify, so
+# ordering after it means systemd won't start phosh.service until logind
+# has genuinely signaled ready, not just been launched.
+After=systemd-logind.service
+Wants=systemd-logind.service
 
 [Service]
-# HybridOS environment: headless display + libinput for touch
+# HybridOS environment: headless display + libinput for touch. The headless
+# backend renders to a memory buffer; kaos-ui-capture reads that buffer and
+# forwards raw RGBA frames to kaos-display-bridge on the Android side.
 Environment=WLR_BACKENDS=headless,libinput
 Environment=WLR_LIBINPUT_NO_DEVICES=1
-Environment=WLR_HEADLESS_OUTPUTS=1
 Environment=WLR_LOG=debug
 Environment=PHOC_DEBUG=auto-maximize
+# Renderer: GPU-accelerated GLES2 via the KGSL-enabled Mesa build. The
+# standard Ubuntu Mesa (25.2.8) cannot use the Adreno 630 on this Android
+# 4.9 kernel: /dev/dri/renderD128 is display-only (msm_drm) and Turnip
+# returns ERROR_INITIALIZATION_FAILED. The KGSL Mesa build (25.1.4 from
+# hybris/mw/mesa-freedreno, freedreno-kmds=kgsl,msm) drives the GPU through
+# /dev/kgsl-3d0 with Zink on top of Turnip, which supports dma-buf export.
+# Confirmed live 2026-08-31: phoc starts with WLR_RENDERER=gles2, maps
+# /dev/kgsl-3d0 and libvulkan_freedreno.so, and kaos-ui-capture connects to
+# its Wayland socket.
+Environment=WLR_RENDERER=gles2
+Environment=WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+Environment=MESA_LOADER_DRIVER_OVERRIDE=zink
+Environment=LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib:/usr/local/mesa-kgsl/lib/dri
+Environment=MESA_DRIVERS_PATH=/usr/local/mesa-kgsl/lib/dri
+Environment=LIBGL_DRIVERS_PATH=/usr/local/mesa-kgsl/lib/dri
+Environment=GBM_BACKENDS_PATH=/usr/local/mesa-kgsl/lib/gbm
+Environment=VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.json
 # libseat's default backend probe picks seatd (its socket is up), but seatd
 # then fails trying to open/manage a real VT (tty0) that doesn't exist in
 # this namespace -- confirmed live 2026-08-28: "Could not open tty0 to
 # update VT" / "Timeout waiting session to become active" / "failed to add
 # backend 'libinput'". systemd-logind is already running here and already
-# opens PAM sessions cleanly with no VT involved, so force libseat onto it
-# instead of letting it default to seatd.
+# opens PAM sessions cleanly with no VT involved, but in a namespace with
+# no real graphics device logind reports CanGraphical=no, so its libseat
+# backend returns "No data available" and phoc still can't create a seat.
+# The kaos-libseat-fake.so LD_PRELOAD shim provides a minimal fake seat
+# (no VT switching, no real DRM device) just enough for headless phoc to
+# start. LIBSEAT_BACKEND=logind is kept for documentation but is effectively
+# a no-op because the shim intercepts every libseat call.
 Environment=LIBSEAT_BACKEND=logind
+Environment=LD_PRELOAD=/usr/local/lib/kaos-libseat-fake.so
 # pam_systemd only assigns a session to seat0 when it sees this hint before
 # the session opens -- without it, confirmed live 2026-08-28: the session
 # opens fine but has no seat at all ("[libseat] Backend 'logind' failed to
 # open seat: No data available" / "Unable to create seat"), same end
 # result (phoc can't create a backend) as the seatd/VT failure this replaced.
 Environment=XDG_SEAT=seat0
-# Override TTY settings — no real VTs in namespace
-TTYPath=
-TTYReset=no
-TTYVHangup=no
-TTYVTDisallocate=no
-StandardInput=null
-# Remove chvt command (no VT switching)
+# XDG_SEAT=seat0 (above) tells pam_systemd this is a real console/seat0
+# session, which makes it determine and validate a VT number for the
+# session -- confirmed live 2026-08-29: with TTYPath cleared and
+# StandardInput=null (the previous override here, from back when this
+# namespace's /dev/tty* nodes didn't reliably exist as real, correctly
+# labeled character devices), pam_systemd had no valid TTY to read a VT
+# number from and rejected the session outright: "pam_systemd(login:
+# session): Failed to create session: VT number out of range" -- phoc
+# never even got a malformed session, logind's own journal showed zero
+# session-open attempts for user phosh at all. Now that the device-node
+# fix above (see the mknod/chcon loop in ns-entry.sh) makes /dev/tty7 a
+# real, correctly labeled character device, phosh.service can just use
+# it directly -- same TTYPath the *base* unit already wants by default,
+# just now genuinely backed by a working node instead of a name that
+# used to resolve to nothing. tty1 is taken by getty@tty1.service, so
+# tty7 (this base unit's own long-standing default) stays free.
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+# Remove chvt command (no VT switching) -- unrelated to the TTY/VT session
+# fix above; this kernel's fbdev/DRM console driver has its own separate,
+# already-diagnosed chvt race, kept masked here regardless of the above.
 ExecStartPost=
 SYSEOF
 
@@ -278,10 +359,205 @@ SYSEOF
             mkdir -p "$CHROOT/etc/systemd/system"
             ln -sf /dev/null "$CHROOT/etc/systemd/system/seatd.service"
 
+            # polkit.service and systemd-resolved.service both ship a full
+            # sandboxing directive set (PrivateDevices=, ProtectSystem=strict,
+            # RestrictNamespaces=, etc). Confirmed live 2026-08-28: both fail
+            # identically with "Failed to set up mount namespacing: /dev:
+            # Invalid argument" (226/NAMESPACE) trying to set that up inside
+            # this already-namespaced container -- likely this kernel (4.9,
+            # far older than mount_setattr()'s 5.12 floor) can't do whatever
+            # nested-namespace trick systemd's sandboxing needs here. These
+            # directives are redundant anyway given the whole-container
+            # isolation kaos-service already provides.
+            #
+            # polkit.service failing matters beyond itself: phoc's logind
+            # session backend calls into org.freedesktop.PolicyKit1 to
+            # activate its session, and that call times out after 25s with
+            # polkit down -- which was the actual, full explanation for
+            # phosh.service's own crash loop this whole time, not anything
+            # in phosh.service itself.
+            #
+            # A .d/ drop-in that empties out just the offending directives
+            # was tried first and did NOT resolve this (confirmed live,
+            # unclear why -- possibly a merge-order subtlety with this
+            # exact directive set). A full unit replacement at the same
+            # /etc/systemd/system/ path (which fully shadows the package's
+            # /lib/systemd/system/ version, no merging involved) does work,
+            # confirmed live: both services start cleanly and phoc/phosh
+            # reach a genuinely stable running state.
+            cat > "$CHROOT/etc/systemd/system/polkit.service" << 'SYSEOF'
+[Unit]
+Description=Authorization Manager
+Documentation=man:polkit(8)
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.PolicyKit1
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+ExecStart=/usr/lib/polkit-1/polkitd --no-debug
+User=polkitd
+SYSEOF
+
+            cat > "$CHROOT/etc/systemd/system/systemd-resolved.service" << 'SYSEOF'
+[Unit]
+Description=Network Name Resolution
+DefaultDependencies=no
+After=systemd-sysctl.service systemd-sysusers.service
+Before=sysinit.target network.target nss-lookup.target shutdown.target initrd-switch-root.target
+Conflicts=shutdown.target initrd-switch-root.target
+Wants=nss-lookup.target
+
+[Service]
+AmbientCapabilities=CAP_SETPCAP CAP_NET_RAW CAP_NET_BIND_SERVICE
+BusName=org.freedesktop.resolve1
+CapabilityBoundingSet=CAP_SETPCAP CAP_NET_RAW CAP_NET_BIND_SERVICE
+ExecStart=!!/usr/lib/systemd/systemd-resolved
+Restart=always
+RestartSec=0
+RuntimeDirectory=systemd/resolve
+RuntimeDirectoryPreserve=yes
+Type=notify
+User=systemd-resolve
+WatchdogSec=3min
+
+[Install]
+WantedBy=sysinit.target
+Alias=dbus-org.freedesktop.resolve1.service
+SYSEOF
+            log "polkit.service and systemd-resolved.service de-sandboxed for containerized boot"
+
             # Enable phosh in graphical.target for non-SailfishOS systemd distros
             mkdir -p "$CHROOT/etc/systemd/system/graphical.target.wants"
             ln -sf /lib/systemd/system/phosh.service "$CHROOT/etc/systemd/system/graphical.target.wants/phosh.service" 2>/dev/null
             log "Systemd phosh.service configured with HybridOS overrides"
+
+            # kaos-ui-stream.service: relays phoc's headless-mode output to
+            # kaos-display-bridge over /dev/socket/kaos_ui.sock. This is the
+            # systemd-path equivalent of the STREAM_PID wf-recorder/ffmpeg
+            # pipeline that already exists in the legacy kaos-init bash
+            # script (see the CANDIDATES fallback further down) -- that
+            # pipeline never runs for a systemd-booted distro like
+            # kaos_mainline at all, so nothing was ever actually feeding
+            # kaos-display-bridge frames here. Runs as the same uid (1000)
+            # as phosh.service -- confirmed live 2026-08-28 that phosh's
+            # own Wayland socket lands at /run/user/1000/wayland-0, mode
+            # 0700, owned by that user, not the root-owned
+            # /run/user/0/wayland-0 the legacy kaos-init pipeline (which
+            # runs everything as root) assumes.
+            # LINUX_MODE isn't computed until much later in this script
+            # (needed here, before unshare_kaos even launches, for the
+            # kaos-ui-stream.service unit-directory symlink below to land
+            # before systemd evaluates graphical.target.wants -- unlike
+            # kaos-display-bridge's own gating further down, which is an
+            # Android-side daemon start with no systemd-timing race to
+            # avoid).
+            EARLY_LINUX_MODE=$(getprop persist.kaos.linux_mode)
+
+            # Real, live display resolution -- not hardcoded, so this
+            # script isn't perseus-specific. "wm size" is a standard AOSP
+            # shell command (framework WindowManager query), available on
+            # any device once Android has booted, which it always has by
+            # the time kaos-service runs this. kaos-display-bridge queries
+            # this itself too (SurfaceComposerClient::getActiveDisplayMode)
+            # so the two independently arrive at the same value rather than
+            # one hardcoding what the other already discovers dynamically.
+            # The fallback only matters if "wm size" itself fails somehow
+            # (unexpected output format, wm not responding) -- without one,
+            # an empty result would silently break the phoc.ini mode= line
+            # below instead of just falling back to a sane default.
+            DISPLAY_SIZE=$(wm size 2>/dev/null | sed -n 's/.*Physical size: *//p')
+            [ -n "$DISPLAY_SIZE" ] || DISPLAY_SIZE="1080x2340"
+
+            # kaos-ui-stream.service's ffmpeg -video_size must match phoc's
+            # actual headless output size (set via phoc.ini below) exactly,
+            # or ffmpeg misinterprets frame boundaries in wf-recorder's raw
+            # byte stream.
+            cat > "$CHROOT/etc/systemd/system/kaos-ui-stream.service" << SYSEOF
+[Unit]
+Description=Kaos UI frame relay (phoc headless capture -> kaos-display-bridge)
+After=phosh.service
+BindsTo=phosh.service
+# Persistent capture failures are caused by phoc's headless renderer
+# entering a bad state after some runtime; restarting phosh resets it.
+OnFailure=kaos-ui-stream-recover.service
+
+[Service]
+Type=simple
+User=1000
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+# After=phosh.service only orders the start job, it doesn't wait for phoc
+# to actually create its Wayland socket -- confirmed live 2026-08-29:
+# the capture client exits immediately if wayland-0 isn't present, and a
+# Type=simple service is considered "started" by systemd as soon as it
+# forks/execs. Wait explicitly for the socket so the first real start
+# attempt doesn't race phoc startup.
+ExecStartPre=/bin/sh -c 'while [ ! -S "\$XDG_RUNTIME_DIR/wayland-0" ]; do sleep 0.5; done'
+ExecStart=/usr/local/bin/kaos-ui-capture
+Restart=on-failure
+RestartSec=2
+# Allow a few quick restart attempts, then give up and let OnFailure
+# restart the whole phosh stack.
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Install]
+WantedBy=graphical.target
+SYSEOF
+
+            # Recovery: when kaos-ui-stream can't stay up, phoc's headless
+            # backend needs a full reset. Restart phosh (and thus phoc).
+            cat > "$CHROOT/etc/systemd/system/kaos-ui-stream-recover.service" << RECOVERYEOF
+[Unit]
+Description=Recover kaos-ui-stream by restarting phosh
+After=phosh.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart phosh.service
+# Prevent restart storms if phosh itself is broken.
+StartLimitIntervalSec=300
+StartLimitBurst=2
+RECOVERYEOF
+
+            # /etc/phosh/phoc.ini: like phosh.service.d and the two unit
+            # overrides above, this only ever got generated in the legacy
+            # kaos-init bash path -- never for a systemd-booted distro like
+            # kaos_mainline. Confirmed live 2026-08-28: without it, phoc's
+            # headless output defaulted to some other resolution entirely
+            # (720x1440, not this device's real display size), which
+            # silently desyncs kaos-ui-stream.service's ffmpeg -video_size
+            # from what wf-recorder is actually capturing.
+            mkdir -p "$CHROOT/etc/phosh" "$CHROOT/usr/share/phosh"
+            if [ "$EARLY_LINUX_MODE" = "1" ]; then
+                cat > "$CHROOT/etc/phosh/phoc.ini" << 'PHOCEOF'
+[core]
+xwayland=false
+
+[output:DSI-1]
+scale = 2
+PHOCEOF
+            else
+                # Overlay mode: headless output captured by kaos-ui-capture and
+                # forwarded to kaos-display-bridge on the Android side.
+                cat > "$CHROOT/etc/phosh/phoc.ini" << PHOCEOF
+[core]
+xwayland=false
+
+[output:HEADLESS-1]
+mode = $DISPLAY_SIZE
+scale = 2
+PHOCEOF
+            fi
+            cp "$CHROOT/etc/phosh/phoc.ini" "$CHROOT/usr/share/phosh/phoc.ini"
+
+            # In LINUX_DIRECT_MODE phoc owns /dev/dri directly and there's
+            # no headless output to capture, so skip enabling the relay
+            # there.
+            if [ "$EARLY_LINUX_MODE" != "1" ]; then
+                ln -sf /etc/systemd/system/kaos-ui-stream.service "$CHROOT/etc/systemd/system/graphical.target.wants/kaos-ui-stream.service" 2>/dev/null
+                log "kaos-ui-stream.service enabled (headless overlay mode)"
+            fi
         else
             log "SailfishOS detected — skipping phosh setup (lipstick is the SFOS compositor)"
         fi
@@ -390,7 +666,7 @@ else
 [core]
 xwayland=false
 
-[output:HEADLESS-1]
+[output:Virtual-1]
 mode = 1080x2340
 scale = 2
 PHOCEOF
@@ -404,15 +680,18 @@ if [ -f /tmp/.linux_mode ]; then
     export WLR_DRM_DEVICES=/dev/dri/card0
     export WLR_DRM_NO_MODIFIERS=1
 else
-    export WLR_BACKENDS=headless,libinput
-    export WLR_LIBINPUT_NO_DEVICES=1
+    # Overlay mode: still use the DRM backend, but the kaos-drm-redirect.so
+    # LD_PRELOAD shim below forces wlroots to enumerate only Virtual-1.
+    # This avoids the headless backend's screencopy reliability issues while
+    # keeping the real DSI-1 panel untouched.
+    export WLR_BACKENDS=drm,libinput
 fi
 export WLR_RENDERER=vulkan
 export LIBSEAT_BACKEND=seatd
 export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
 export VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
 export LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib/aarch64-linux-gnu
-export LD_PRELOAD=/usr/local/lib/kgsl_drm_shim.so
+export LD_PRELOAD=/usr/local/lib/kgsl_drm_shim.so:/usr/local/lib/kaos-drm-redirect.so
 export GBM_BACKEND=kgsl
 export GBM_BACKENDS_PATH=/usr/local/lib/gbm
 export XDG_SESSION_TYPE=wayland
@@ -646,11 +925,17 @@ INITEOF
         touch "$CHROOT/tmp/.linux_mode"
         log "Linux Direct Mode enabled (DRM + native touch)"
 
-        # Stop Android services not needed in Linux mode
-        # kaos-service runs as u:r:toolbox:s0 which can't set ctl.stop properties
-        # Use runcon to switch to su context for the stop commands
+        # Stop only the Android services that actually block Linux from owning
+        # hardware. Based on SailfishOS droid-hal-startup.sh inventory:
+        # keep zygote/system_server, modem (qcrild), camera, and media services
+        # alive so Linux Direct Mode still has telephony. Display, audio, and
+        # WiFi are torn down because the Linux namespace owns them directly.
+        # Only a few Android-only helpers are stopped as well.
+        #
+        # kaos-service runs as u:r:toolbox:s0 which can't set ctl.stop properties,
+        # so use runcon to switch to su context for the stop commands.
 
-        # Tier 1: Display stack (must stop to release DRM master)
+        # Display stack (must stop to release DRM master for phoc)
         runcon u:r:su:s0 stop surfaceflinger 2>/dev/null
         runcon u:r:su:s0 stop vendor.hwcomposer-2-3 2>/dev/null
         runcon u:r:su:s0 stop vendor.qti.hardware.display.allocator 2>/dev/null
@@ -661,33 +946,30 @@ INITEOF
         runcon u:r:su:s0 stop bootanim 2>/dev/null
         runcon u:r:su:s0 stop ppd 2>/dev/null
 
-        # Tier 2: Android framework (frees ~500MB RAM)
-        runcon u:r:su:s0 stop zygote 2>/dev/null
-        runcon u:r:su:s0 stop zygote_secondary 2>/dev/null
-
-        # Tier 3: Media/camera/codec (not needed in Linux mode)
+        # Audio stack: in Linux Direct Mode the Linux namespace owns audio
+        # (PulseAudio/PipeWire via ALSA/droid HAL). Leaving Android's
+        # audioserver running makes it fight for the DSP/codec.
         runcon u:r:su:s0 stop audioserver 2>/dev/null
         runcon u:r:su:s0 stop vendor.audio-hal 2>/dev/null
-        runcon u:r:su:s0 stop cameraserver 2>/dev/null
-        runcon u:r:su:s0 stop vendor.camera-provider-2-4 2>/dev/null
-        runcon u:r:su:s0 stop media 2>/dev/null
-        runcon u:r:su:s0 stop mediaextractor 2>/dev/null
-        runcon u:r:su:s0 stop mediametrics 2>/dev/null
-        runcon u:r:su:s0 stop media.swcodec 2>/dev/null
-        runcon u:r:su:s0 stop vendor.media.omx 2>/dev/null
-        runcon u:r:su:s0 stop vendor.vppservice 2>/dev/null
-        runcon u:r:su:s0 stop wfdhdcphalservice 2>/dev/null
-        runcon u:r:su:s0 stop wifidisplayhalservice 2>/dev/null
 
-        # Tier 4: Android-only services (DRM content, telemetry, payments, misc)
-        runcon u:r:su:s0 stop drm 2>/dev/null
+        # WiFi stack: in Linux Direct Mode the Linux namespace owns wlan0 via
+        # its own wpa_supplicant + dhcpcd. Android's vendor HAL and cnss-daemon
+        # hold the interface and prevent Linux association; stop them so Linux
+        # can take ownership. wificond is left stopped as well because it will
+        # otherwise restart the Android HAL and fight for control.
+        runcon u:r:su:s0 stop wificond 2>/dev/null
+        runcon u:r:su:s0 stop vendor.wifi_hal_legacy 2>/dev/null
+        runcon u:r:su:s0 stop vendor.cnss-daemon 2>/dev/null
+
+        # Android-only services with no Linux consumer (telemetry, payments,
+        # DRM content, misc). Keeping these stopped reduces crash-loop spam
+        # and frees a little RAM without affecting WiFi/modem/audio.
         runcon u:r:su:s0 stop vendor.drm-clearkey-service 2>/dev/null
         runcon u:r:su:s0 stop vendor.drm-widevine-hal-1-2 2>/dev/null
         runcon u:r:su:s0 stop vendor.cas-hal-1-2 2>/dev/null
         runcon u:r:su:s0 stop credstore 2>/dev/null
         runcon u:r:su:s0 stop incidentd 2>/dev/null
         runcon u:r:su:s0 stop statsd 2>/dev/null
-        runcon u:r:su:s0 stop storaged 2>/dev/null
         runcon u:r:su:s0 stop traced 2>/dev/null
         runcon u:r:su:s0 stop traced_probes 2>/dev/null
         runcon u:r:su:s0 stop neuralnetworks_hal_service 2>/dev/null
@@ -699,8 +981,6 @@ INITEOF
         runcon u:r:su:s0 stop qteeconnector-hal-1-0 2>/dev/null
         runcon u:r:su:s0 stop qti_esepowermanager_service 2>/dev/null
         runcon u:r:su:s0 stop secureelement-hal 2>/dev/null
-        runcon u:r:su:s0 stop sensorscal-hal-1-0 2>/dev/null
-        runcon u:r:su:s0 stop vendor.capabilityconfigstore 2>/dev/null
         runcon u:r:su:s0 stop seemp_healthd 2>/dev/null
         runcon u:r:su:s0 stop lhd 2>/dev/null
         runcon u:r:su:s0 stop dpmQmiMgr 2>/dev/null
@@ -719,7 +999,7 @@ INITEOF
             [ -n "$hwc_pid" ] && kill -9 $hwc_pid 2>/dev/null
             sleep 1
         fi
-        log "Stopped Android services for Linux Direct Mode"
+        log "Stopped Android display-only services for Linux Direct Mode (WiFi/modem/framework preserved)"
     else
         rm -f "$CHROOT/tmp/.linux_mode"
     fi
@@ -778,55 +1058,109 @@ mount -t sysfs sys /sys 2>/dev/null
 # include). The standard fix on any modern system is this exact symlink.
 [ -e /etc/mtab ] || ln -sf /proc/self/mounts /etc/mtab 2>/dev/null
 
-# do_mounts() already bind-mounted the host's /dev/socket onto this
-# chroot's /dev/socket before we ever got here (see kaos-service) -- but
-# the very next command wipes it: mounting a fresh tmpfs over /dev shadows
-# everything underneath, submounts included, the same way it would shadow
-# a plain file or directory. A shell's current working directory is a
-# kernel-level dentry reference, not a path -- cd'ing into the bind mount
-# now, before the tmpfs remount, keeps that reference alive regardless of
-# what gets mounted over the path it used to be reachable through, so it
-# can be bound back afterward via /proc/self/cwd. Confirmed live
-# 2026-08-27 in isolation (a throwaway namespace, not this one) that this
-# genuinely round-trips real content across the remount; every other
-# do_mounts() bind mount (/system, /vendor, /dev/dri) already survives
-# unshare_kaos + chroot fine without this, so this is the one exception,
-# not a pattern to generalize.
-cd /dev/socket 2>/dev/null
-
 # /dev: mount as tmpfs and populate essential nodes.
 # We cannot use devtmpfs (kernel singleton shared with Android host).
 mount -t tmpfs tmpfs /dev -o mode=0755 2>/dev/null
 mkdir -p /dev/pts /dev/shm /dev/mqueue
 
-# Restore /dev/socket (see the cd above) now that the fresh /dev exists to
-# put it back into. Harmless if the cd above silently failed (do_mounts()
-# bind mount missing for some reason) -- mkdir/mount just target an empty
-# tmpfs directory instead, no worse off than before this fix existed.
-mkdir -p /dev/socket
-mount --bind /proc/self/cwd /dev/socket 2>/dev/null
+# do_mounts() bind-mounts the host's real /dev/socket twice: once onto
+# this chroot's own /dev/socket (which the tmpfs remount above just
+# shadowed -- mounting fresh over /dev shadows everything underneath,
+# submounts included, the same way it would shadow a plain file or
+# directory) and once more onto /mnt/android-dev-socket, a path this
+# script never touches and so never shadows. A plain symlink to that
+# second bind is all /dev/socket needs post-remount -- confirmed live
+# 2026-08-28 this survives correctly, unlike the previous approach here
+# (cd into the bind mount before the remount to pin its dentry via the
+# shell's cwd, then "mount --bind /proc/self/cwd /dev/socket" after),
+# which reported success but silently produced an empty /dev/socket: a
+# plain `ls -la /proc/self/cwd/` right up to that mount call showed the
+# real, pinned content was still there, but binding *from* that magic
+# symlink as the source didn't carry it through.
+ln -sf /mnt/android-dev-socket /dev/socket 2>/dev/null
 
-# /dev/null first, and WITHOUT a "2>/dev/null" of its own -- /dev is a
-# freshly emptied tmpfs at this point, so /dev/null does not exist yet, and
-# a "2>/dev/null" redirect on the very command that creates it races
-# against itself: the shell has to open (and, since nothing is there yet,
-# create) a plain regular file at /dev/null just to set up that redirect,
-# and by the time mknod's own syscall runs a moment later, something
-# already exists at that path -- mknod fails with EEXIST, silently, into
-# the bogus file its own redirect just made. Confirmed live 2026-08-27:
-# this is exactly why /dev/null kept ending up as a 0-byte regular file
-# instead of a real character device, which in turn made agetty segfault
-# stat()ing /dev/console (a symlink to that broken /dev/null). Every other
-# node's own mknod is safe to self-redirect since by the time they run,
-# /dev/null already exists for real.
-mknod -m 0666 /dev/null c 1 3
+# Same symlink trick for /dev/snd: the real ALSA device nodes live on the
+# Android host; do_mounts() bind-mounts them at /mnt/android-dev-snd before
+# the namespace starts, and this symlink survives the /dev tmpfs remount.
+ln -sf /mnt/android-dev-snd /dev/snd 2>/dev/null
 
-for node in "zero c 1 5 0666" "full c 1 7 0666" \
-            "random c 1 8 0666" "urandom c 1 9 0666" "tty c 5 0 0666" \
-            "tty0 c 4 0 0620" "tty1 c 4 1 0620" "tty7 c 4 7 0620"; do
+# /dev/null needs to exist before *any* later "2>/dev/null" in this script
+# can be set up without racing -- removing the mknod line's own redirect
+# (2026-08-27 fix, see git history) was not enough on its own: the very
+# next line below this block, "ln -sf ... /dev/socket 2>/dev/null", *also*
+# runs after the fresh /dev tmpfs remount, and its own redirect setup hits
+# the exact same race -- the shell has to open (and, since nothing is
+# there yet on the brand new tmpfs, create) a plain regular file at
+# /dev/null just to satisfy that redirect, and by the time this block's
+# mknod syscall runs moments later, something already exists at that path
+# -- confirmed live 2026-08-29 via namespace-boot.log: "mknod: /dev/null:
+# File exists", even on a freshly mounted, verified-empty tmpfs. A regular
+# file there (instead of a real character device) is what made sshd fail
+# with "Couldn't open /dev/null: Permission denied" and made phoc's GLib-
+# based spawn of its gnome-session startup command fail with "Failed to
+# open file to remap file descriptor (Permission denied)".
+# Fix: build the real device node under a name nothing else could ever
+# collide with, label it, then atomically replace whatever (if anything)
+# is squatting at /dev/null with mv -- this can never race, since mknod
+# never has to contend for the /dev/null path at all.
+mknod -m 0666 /dev/.null.tmp c 1 3
+chcon u:object_r:null_device:s0 /dev/.null.tmp 2>/dev/null
+mv -f /dev/.null.tmp /dev/null
+
+# Real SELinux types for each node, confirmed live 2026-08-29 against
+# Android's own /dev (ls -laZ) -- these mknod'd nodes previously got no
+# explicit label at all, so each landed on whatever type SELinux's default
+# transition happened to produce for ns-entry.sh's own domain at the time
+# (observed as "shell_data_file" one boot, "appdomain_tmpfs" another),
+# neither of which any policy allow-rule expects a device node to carry.
+# That's what was silently breaking anything that opens these nodes --
+# confirmed live: sshd ("Couldn't open /dev/null: Permission denied") and
+# phoc's own GLib-based spawn of its gnome-session startup command
+# ("Failed to open file to remap file descriptor (Permission denied)"),
+# even though DAC permissions (mode bits) were always correct.
+for node in "zero c 1 5 0666 zero_device" "full c 1 7 0666 device" \
+            "random c 1 8 0666 random_device" "urandom c 1 9 0666 random_device" \
+            "tty c 5 0 0666 owntty_device" \
+            "tty0 c 4 0 0620 tty_device" "tty1 c 4 1 0620 tty_device" \
+            "tty7 c 4 7 0620 tty_device"; do
     set -- $node
-    mknod -m "$4" "/dev/$1" $2 $3 2>/dev/null
+    mknod -m "$5" "/dev/$1" $2 $3 $4 2>/dev/null
+    chcon "u:object_r:$6:s0" "/dev/$1" 2>/dev/null
 done
+
+# DRM nodes for GPU/Display access (e.g. phoc's drm backend, GBM/EGL).
+# Major/minor and label match Android's own /dev/dri/* nodes.
+# mkdir's mode here is subject to whatever umask this script's own ancestor
+# chain (kaos-bridge, etc.) inherits -- confirmed live 2026-08-30: it landed
+# on 0700 (root-only), which blocks phosh (in the video group, but group
+# bits mean nothing against a 700 directory) from ever reaching card0/
+# renderD128 despite those nodes themselves being correctly 0666. Android's
+# own /dev/dri is 0755; match that explicitly rather than trusting mkdir -p's
+# umask-derived default.
+mkdir -p /dev/dri
+chmod 0755 /dev/dri
+mknod -m 0666 /dev/dri/card0 c 226 0 2>/dev/null
+chcon u:object_r:graphics_device:s0 /dev/dri/card0 2>/dev/null
+mknod -m 0666 /dev/dri/renderD128 c 226 128 2>/dev/null
+chcon u:object_r:graphics_device:s0 /dev/dri/renderD128 2>/dev/null
+
+# Adreno GPU (KGSL) node -- without this, phoc's GLES2 renderer fails EGL
+# init every single start ("DRI2: failed to create screen" / "failed to
+# load driver" / "Could not initialize EGL", confirmed live 2026-08-30 in
+# its own journal) and silently falls back to software rendering instead.
+# /dev/dri/card0 alone is not enough; Mesa's DRI2 EGL path needs the actual
+# GPU device to submit rendering commands. Major/minor/label match
+# Android's own /dev/kgsl-3d0.
+mknod -m 0666 /dev/kgsl-3d0 c 238 0 2>/dev/null
+chcon u:object_r:gpu_device:s0 /dev/kgsl-3d0 2>/dev/null
+
+# ION memory allocator node -- required by Turnip/Zink on KGSL to allocate
+# device memory and export dma-buf handles. Without it, Zink logs
+# "couldn't allocate memory: heap=0" and wlroots' GBM allocator fails with
+# "gbm_bo_get_fd_for_plane failed", confirmed live 2026-08-31. Major/minor
+# and label match Android's own /dev/ion.
+mknod -m 0666 /dev/ion c 10 62 2>/dev/null
+chcon u:object_r:ion_device:s0 /dev/ion 2>/dev/null
 
 # Console: real device unavailable in namespace, redirect to null
 ln -sf /dev/null /dev/console
@@ -1085,10 +1419,11 @@ NSEOF
     echo $! > "$INPUT_PID_FILE"
 
     # Start the SurfaceFlinger display bridge — only relevant in headless
-    # overlay mode (kaos-init's wf-recorder pipeline feeds it frames over
-    # /dev/socket/kaos_ui.sock). In LINUX_DIRECT_MODE phoc owns /dev/dri
-    # directly and nothing captures/relays frames, so it would sit idle;
-    # skip starting it there.
+    # overlay mode (fed frames over /dev/socket/kaos_ui.sock, either by
+    # kaos-ui-stream.service for a systemd-booted distro or by kaos-init's
+    # own wf-recorder pipeline for the non-systemd fallback). In
+    # LINUX_DIRECT_MODE phoc owns /dev/dri directly and nothing captures/
+    # relays frames, so it would sit idle; skip starting it there.
     if [ "$LINUX_MODE" != "1" ]; then
         runcon u:r:su:s0 /system/bin/kaos-display-bridge > "$CHROOT/var/log/kaos-display-bridge.log" 2>&1 &
         echo $! > "$DISPLAY_BRIDGE_PID_FILE"
