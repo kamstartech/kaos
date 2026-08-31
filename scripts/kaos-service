@@ -1189,6 +1189,68 @@ mount -t tmpfs tmpfs /dev/shm -o mode=1777,nosuid,nodev 2>/dev/null
 mount -t tmpfs tmpfs /run -o mode=0755,nosuid,nodev 2>/dev/null
 mount -t tmpfs tmpfs /tmp -o mode=1777,nosuid,nodev 2>/dev/null
 
+# --- Phase 1c: Virtual touchscreen device for libinput ---
+# Android-side kaos-touch-input creates a uinput touchscreen on the host
+# (/dev/input/eventN). It appears in this namespace's sysfs, but with
+# systemd-udevd masked there is no one to create the /dev/input node or the
+# udev seat tag that libinput needs. Do it here so both the systemd and the
+# legacy kaos-init paths see a real touchscreen device.
+setup_kaos_touch() {
+    mkdir -p /dev/input /run/udev /run/udev/data /run/udev/tags/seat
+    # phosh (uid 1000, not in the 'input' group) needs to read the udev db
+    # and open the event node, so world-accessible permissions are required
+    # despite the host's /dev/input being group-restricted.
+    chmod 0755 /dev/input /run/udev /run/udev/data /run/udev/tags /run/udev/tags/seat
+    # Match Android's own /dev/input SELinux label for input event nodes.
+    chcon u:object_r:input_device:s0 /dev/input 2>/dev/null || true
+
+    # The Android-side daemon is started before the namespace but uinput
+    # device registration is asynchronous. Poll /sys for up to ~10s before
+    # giving up; this keeps early boot from blocking forever on touch.
+    try=0
+    while [ "$try" -lt 50 ]; do
+        for sysdev in /sys/class/input/event*/device/name; do
+            [ -f "$sysdev" ] || continue
+            NAME=$(cat "$sysdev" 2>/dev/null)
+            if [ "$NAME" = "kaos-touch" ]; then
+                EVDEV=$(echo "$sysdev" | sed 's|/sys/class/input/\(event[0-9]*\)/.*|\1|')
+                MAJOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f1)
+                MINOR=$(cat "/sys/class/input/$EVDEV/dev" 2>/dev/null | cut -d: -f2)
+                INPUTNUM=$(echo "$EVDEV" | sed 's/event//')
+
+                rm -f "/dev/input/$EVDEV"
+                mknod -m 0666 "/dev/input/$EVDEV" c "$MAJOR" "$MINOR" 2>/dev/null
+                chcon u:object_r:input_device:s0 "/dev/input/$EVDEV" 2>/dev/null || true
+
+                cat > "/run/udev/data/c${MAJOR}:${MINOR}" << UDEVEOF
+I:$(date +%s)
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+V:1
+UDEVEOF
+                cat > "/run/udev/data/+input:input${INPUTNUM}" << UDEVEOF
+E:ID_INPUT=1
+E:ID_INPUT_TOUCHSCREEN=1
+G:seat
+V:1
+UDEVEOF
+                chmod 0644 "/run/udev/data/c${MAJOR}:${MINOR}" "/run/udev/data/+input:input${INPUTNUM}"
+                ln -sf "/run/udev/data/c${MAJOR}:${MINOR}" "/run/udev/tags/seat/c${MAJOR}:${MINOR}"
+                ln -sf "/run/udev/data/+input:input${INPUTNUM}" "/run/udev/tags/seat/+input:input${INPUTNUM}"
+
+                log "Registered $EVDEV (c${MAJOR}:${MINOR}) as kaos-touch for libinput"
+                return 0
+            fi
+        done
+        try=$((try + 1))
+        sleep 0.2
+    done
+    log "WARNING: kaos-touch device not found in /sys; touch will not work"
+    return 1
+}
+setup_kaos_touch
+
 # --- Phase 1b: Private cgroup hierarchy for systemd ---
 # systemd needs somewhere to track its own units via a real, writable
 # cgroup2 root, genuinely isolated from Android's own cgroup tree. Requires
