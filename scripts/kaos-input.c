@@ -63,12 +63,16 @@ static int setup_uinput(void) {
     setup.id.product = 0x5678;
     setup.id.version = 1;
 
-    struct uinput_abs_setup abs_x    = { .code = ABS_X,              .absinfo = { .maximum = DISPLAY_W } };
-    struct uinput_abs_setup abs_y    = { .code = ABS_Y,              .absinfo = { .maximum = DISPLAY_H } };
-    struct uinput_abs_setup mt_slot  = { .code = ABS_MT_SLOT,        .absinfo = { .maximum = MAX_SLOTS - 1 } };
-    struct uinput_abs_setup mt_id    = { .code = ABS_MT_TRACKING_ID, .absinfo = { .maximum = 65535 } };
-    struct uinput_abs_setup mt_x     = { .code = ABS_MT_POSITION_X,  .absinfo = { .maximum = DISPLAY_W } };
-    struct uinput_abs_setup mt_y     = { .code = ABS_MT_POSITION_Y,  .absinfo = { .maximum = DISPLAY_H } };
+    /* Resolution ≈ 16 units/mm matches a ~6.39" 1080×2340 panel, giving
+     * libinput a real device size so it can produce valid normalized [0,1]
+     * touch coordinates for wlroots/phoc. Without this, headless output's
+     * zero physical size leaves libinput unable to map touches to surfaces. */
+    struct uinput_abs_setup abs_x    = { .code = ABS_X,              .absinfo = { .minimum = 0, .maximum = DISPLAY_W, .resolution = 16 } };
+    struct uinput_abs_setup abs_y    = { .code = ABS_Y,              .absinfo = { .minimum = 0, .maximum = DISPLAY_H, .resolution = 16 } };
+    struct uinput_abs_setup mt_slot  = { .code = ABS_MT_SLOT,        .absinfo = { .minimum = 0, .maximum = MAX_SLOTS - 1 } };
+    struct uinput_abs_setup mt_id    = { .code = ABS_MT_TRACKING_ID, .absinfo = { .minimum = 0, .maximum = 65535 } };
+    struct uinput_abs_setup mt_x     = { .code = ABS_MT_POSITION_X,  .absinfo = { .minimum = 0, .maximum = DISPLAY_W, .resolution = 16 } };
+    struct uinput_abs_setup mt_y     = { .code = ABS_MT_POSITION_Y,  .absinfo = { .minimum = 0, .maximum = DISPLAY_H, .resolution = 16 } };
 
     ioctl(fd, UI_DEV_SETUP, &setup);
     ioctl(fd, UI_ABS_SETUP, &abs_x);

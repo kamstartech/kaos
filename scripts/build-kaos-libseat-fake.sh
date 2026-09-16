@@ -8,7 +8,7 @@
 # Usage:
 #   ./build-kaos-libseat-fake.sh [distro-id]
 
-DISTRO_ID="${1:-kaos_mainline}"
+DISTRO_ID="${1:-ubuntu}"
 CHROOT="/data/.stowaway/$DISTRO_ID"
 SRC="$(dirname "$0")/kaos-libseat-fake.c"
 

@@ -3,7 +3,7 @@
 #
 # kaos-ui-capture is a glibc binary that links against the chroot's
 # libwayland-client (not bionic), so it cannot be built by AOSP's mka.
-# Run this on the Android host while the target distro (e.g. kaos_mainline)
+# Run this on the Android host while the target distro (e.g. ubuntu)
 # is running and reachable via SSH/adb.
 #
 # Usage:
@@ -13,7 +13,7 @@
 # the chroot and should be picked up from there by build-rootfs.sh when
 # the rootfs tarball is regenerated.
 
-DISTRO_ID="${1:-kaos_mainline}"
+DISTRO_ID="${1:-ubuntu}"
 CHROOT="/data/.stowaway/$DISTRO_ID"
 SRC="$(dirname "$0")/kaos-ui-capture.cpp"
 PROTO="$(dirname "$0")/wlr-screencopy-unstable-v1.xml"

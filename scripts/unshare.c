@@ -37,6 +37,16 @@ static void usage(const char *prog) {
         "  -T, --time        unshare time namespace\n"
         "  -f, --fork        fork before exec\n"
         "  --mount-proc[=DIR]  mount /proc after unsharing PID ns\n"
+        "  -R, --root=DIR    become root of the new mount namespace at DIR\n"
+        "                    (chdir DIR, MS_MOVE onto \"/\", chroot \".\") instead\n"
+        "                    of just chroot(2)ing into a bind mount under the old\n"
+        "                    root -- requires -m. A plain chroot() leaves fs->root\n"
+        "                    != the mount namespace's own root, which the kernel's\n"
+        "                    current_chrooted() then uses to deny every\n"
+        "                    unshare(CLONE_NEWUSER) inside, for every process,\n"
+        "                    root included (see kernel/user_namespace.c,\n"
+        "                    create_user_ns()) -- this is what breaks bubblewrap\n"
+        "                    and any systemd PrivateUsers= service inside DIR.\n"
         "  -h, --help        show this help\n",
         prog);
     exit(1);
@@ -47,6 +57,7 @@ int main(int argc, char *argv[]) {
     int do_fork = 0;
     int mount_proc = 0;
     const char *proc_dir = "/proc";
+    const char *new_root = NULL;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -76,6 +87,21 @@ int main(int argc, char *argv[]) {
                 proc_dir = &argv[i][13];
             continue;
         }
+        if (strncmp(argv[i], "--root=", 7) == 0) { new_root = &argv[i][7]; continue; }
+
+        /* -R takes its argument as a separate argv token (unlike the other
+         * short options, which are flags only and can be clustered, e.g.
+         * -mpf) -- handle it before the clustered-short-option loop below
+         * so "-R DIR" isn't misparsed as the flag cluster "-R" followed by
+         * a bare positional DIR. */
+        if (strcmp(argv[i], "-R") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: -R requires an argument\n", argv[0]);
+                usage(argv[0]);
+            }
+            new_root = argv[++i];
+            continue;
+        }
 
         /* Short options (can be combined: -mpf) */
         const char *p = &argv[i][1];
@@ -102,6 +128,11 @@ int main(int argc, char *argv[]) {
     if (i >= argc) {
         fprintf(stderr, "%s: no program specified\n", argv[0]);
         usage(argv[0]);
+    }
+
+    if (new_root && !(flags & CLONE_NEWNS)) {
+        fprintf(stderr, "%s: -R/--root requires -m/--mount\n", argv[0]);
+        return 1;
     }
 
     if (unshare(flags) != 0) {
@@ -147,6 +178,40 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         /* Child continues */
+    }
+
+    /* -R: become the real root of this (already private, per above) mount
+     * namespace, not merely chroot(2)ed into a bind mount under the old
+     * one. Same chdir -> MS_MOVE -> chroot(".") sequence already proven by
+     * hybridos_switch_root() in system/extras/multirom/trampoline/
+     * trampoline.c -- unlike that caller, we don't lazy-unmount anything
+     * else first: DIR is expected to be a single leaf bind mount (not the
+     * real "/" with 100+ Android mounts hanging off it), so MS_MOVEing it
+     * onto "/" just re-parents that one mount (and anything already
+     * mounted under it) without touching Android's own mount tree, which
+     * stays reachable under it (now invisible, still mounted) exactly as
+     * it would after a plain chroot(2) -- this only changes what the
+     * kernel considers this mount namespace's root to be. Must run before
+     * mount_proc below, so --mount-proc=DIR (if ever combined with -R) is
+     * relative to the new root, not the old one. */
+    if (new_root) {
+        if (chdir(new_root) != 0) {
+            fprintf(stderr, "%s: chdir '%s' failed: %s\n", argv[0], new_root, strerror(errno));
+            return 1;
+        }
+        if (mount(new_root, "/", NULL, MS_MOVE, NULL) != 0) {
+            fprintf(stderr, "%s: MS_MOVE '%s' onto '/' failed: %s\n",
+                    argv[0], new_root, strerror(errno));
+            return 1;
+        }
+        if (chroot(".") != 0) {
+            fprintf(stderr, "%s: chroot failed: %s\n", argv[0], strerror(errno));
+            return 1;
+        }
+        if (chdir("/") != 0) {
+            fprintf(stderr, "%s: chdir '/' after chroot failed: %s\n", argv[0], strerror(errno));
+            return 1;
+        }
     }
 
     if (mount_proc) {

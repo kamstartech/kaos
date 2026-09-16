@@ -160,7 +160,19 @@ case "$1" in
             echo "ERROR: [${DISTRO_NAME}] Stale PID file removed. Namespace is not running."
             exit 1
         fi
-        exec runcon u:r:su:s0 /system/bin/busybox_kaos nsenter -t "$TARGET_PID" -m -u -i -p -- /system/bin/chroot "$CHROOT" "$@"
+        # chroot to "/", not "$CHROOT": nsenter -m joins the namespace kaos-
+        # service already started, and since kaos-service now enters it via
+        # unshare_kaos -R (MS_MOVE + chroot(".") -- see kaos-service for
+        # why), that namespace's own "/" already IS $CHROOT's content;
+        # $CHROOT as an absolute path no longer resolves to anything inside
+        # it (the mount that used to be visible there was moved away).
+        # chroot(".")ing to "/" here, from a process that only just joined
+        # the namespace via nsenter, correctly sets this process's own
+        # fs->root to match the namespace's real root too, so an
+        # interactive `kaos-starter exec`/`login` shell also gets working
+        # unshare(CLONE_NEWUSER) (bwrap, etc.), not just the long-running
+        # init process kaos-service started.
+        exec runcon u:r:su:s0 /system/bin/busybox_kaos nsenter -t "$TARGET_PID" -m -u -i -p -- /system/bin/chroot / "$@"
         ;;
     login)
         $0 ${_DISTRO_ARG:+--distro $_DISTRO_ARG} exec "${DISTRO_SHELL:-/bin/bash}" -l

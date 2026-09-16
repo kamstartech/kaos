@@ -133,10 +133,12 @@ int libseat_open_device(struct libseat *seat, const char *path, int *fd)
 
     int dev_fd;
     if (path && strncmp(path, "/dev/dri/card", 13) == 0) {
-        /* Headless mode doesn't need a real KMS device. Give it /dev/null
-         * so wlroots has a valid fd to poll, but it won't actually issue
-         * KMS ioctls against it. */
-        dev_fd = real_open ? real_open("/dev/null", O_RDWR | O_CLOEXEC) : open("/dev/null", O_RDWR | O_CLOEXEC);
+        /* For the DRM backend we must hand wlroots the real KMS device so it
+         * can enumerate connectors and commit CRTCs.  The headless backend
+         * never asks for /dev/dri/card*, so this is safe for overlay/headless
+         * mode as well. */
+        dev_fd = real_open ? real_open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK)
+                           : open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     } else if (path) {
         dev_fd = real_open ? real_open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK) : open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     } else {

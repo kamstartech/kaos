@@ -143,7 +143,7 @@ PRODUCT_COPY_FILES += \
 #
 # privapp-permissions-kaos.xml carries the CORRECT, real installed package
 # names for these three apps' actual signature|privileged permission
-# requests (com.kaos.phosh, com.offsec.nhterm, com.android.aliceagent --
+# requests (com.kaos.phosh, com.offsec.nhterm, com.kaos.agent --
 # confirmed live via a system_server dropbox crash: PackageManagerService's
 # systemReady() throws an uncaught, fatal IllegalStateException when any
 # priv-app requests such a permission that isn't allowlisted anywhere, which
@@ -158,7 +158,7 @@ PRODUCT_COPY_FILES += \
 PRODUCT_PACKAGES += \
     KaosTerm \
     PhoshApp \
-    AliceAgent \
+    KaosAgent \
     privapp-permissions-kaos-term.xml \
     privapp-permissions-kaos-app.xml \
     privapp-permissions-kaos.xml

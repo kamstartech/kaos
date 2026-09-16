@@ -287,7 +287,10 @@ Wants=systemd-logind.service
 # backend renders to a memory buffer; kaos-ui-capture reads that buffer and
 # forwards raw RGBA frames to kaos-display-bridge on the Android side.
 Environment=WLR_BACKENDS=headless,libinput
-Environment=WLR_LIBINPUT_NO_DEVICES=1
+# NOTE: WLR_LIBINPUT_NO_DEVICES must NOT be set here. It makes wlroots skip
+# the initial handle_libinput_readable() drain, so devices that appear after
+# phoc starts (the kaos-touch uinput device) are never added to the seat —
+# seat capabilities stay 0x0 and no wl_touch events ever reach phosh.
 Environment=WLR_LOG=debug
 Environment=PHOC_DEBUG=auto-maximize
 # Renderer: GPU-accelerated GLES2 via the KGSL-enabled Mesa build. The
@@ -424,6 +427,23 @@ WatchdogSec=3min
 WantedBy=sysinit.target
 Alias=dbus-org.freedesktop.resolve1.service
 SYSEOF
+
+            # upower.service ships PrivateUsers=yes, which needs a user
+            # namespace -- unavailable in this container (kernel 4.9 has no
+            # usable userns here; `unshare --user` fails EPERM even as root,
+            # confirmed live 2026-09-05). Without this, upowerd fails with
+            # status 217/USER and every D-Bus activation of
+            # org.freedesktop.UPower burns a 25s service_start_timeout --
+            # phosh blocks on that during shell startup, delaying all shell
+            # UI surfaces by ~50s. A drop-in disabling just PrivateUsers was
+            # verified live: upower reaches active and shell UI maps in ~3s.
+            mkdir -p "$CHROOT/etc/systemd/system/upower.service.d"
+            cat > "$CHROOT/etc/systemd/system/upower.service.d/kaos-userns.conf" << 'SYSEOF'
+[Service]
+PrivateUsers=no
+SYSEOF
+            log "upower.service de-sandboxed (PrivateUsers=no) for containerized boot"
+
             log "polkit.service and systemd-resolved.service de-sandboxed for containerized boot"
 
             # Enable phosh in graphical.target for non-SailfishOS systemd distros
@@ -468,18 +488,35 @@ SYSEOF
             DISPLAY_SIZE=$(wm size 2>/dev/null | sed -n 's/.*Physical size: *//p')
             [ -n "$DISPLAY_SIZE" ] || DISPLAY_SIZE="1080x2340"
 
-            # kaos-ui-stream.service's ffmpeg -video_size must match phoc's
-            # actual headless output size (set via phoc.ini below) exactly,
-            # or ffmpeg misinterprets frame boundaries in wf-recorder's raw
-            # byte stream.
+            # DISPLAY_SIZE feeds phoc.ini's headless mode= line below; the
+            # KFR1 header from kaos-ui-capture carries the real width/height/
+            # stride per frame, so the bridge no longer depends on the two
+            # sides agreeing out of band (the old ffmpeg -video_size did).
             cat > "$CHROOT/etc/systemd/system/kaos-ui-stream.service" << SYSEOF
 [Unit]
 Description=Kaos UI frame relay (phoc headless capture -> kaos-display-bridge)
 After=phosh.service
 BindsTo=phosh.service
-# Persistent capture failures are caused by phoc's headless renderer
-# entering a bad state after some runtime; restarting phosh resets it.
+# BindsTo only propagates *stop*: when phosh.service restarts (crash,
+# kaos-ui-stream-recover, a manual systemctl restart) this unit is
+# stopped and never started again, because the only thing pulling it in
+# was graphical.target at boot. Confirmed live 2026-09-14: phosh came
+# back at 17:34 and the relay stayed dead for over an hour, so
+# kaos-display-bridge never received a frame. PartOf makes a phosh
+# restart restart us too, and the phosh.service.wants symlink (see the
+# [Install] section) makes any fresh phosh start pull us in.
+PartOf=phosh.service
+# Persistent capture failures used to come from phoc leaking one dmabuf
+# fd per frame until it hit RLIMIT_NOFILE and stopped serving clients
+# (zink, fixed by hybris/kaos-configs/patches/mesa/0001-*.patch); the
+# recovery unit stays as the generic "phoc is wedged" escape hatch.
 OnFailure=kaos-ui-stream-recover.service
+# Allow a few quick restart attempts, then give up and let OnFailure
+# restart the whole phosh stack. These keys belong in [Unit] -- in
+# [Service] systemd logs "Unknown key name" and silently falls back to
+# the 5-in-10s default, which is what was actually in effect before.
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -496,13 +533,9 @@ ExecStartPre=/bin/sh -c 'while [ ! -S "\$XDG_RUNTIME_DIR/wayland-0" ]; do sleep 
 ExecStart=/usr/local/bin/kaos-ui-capture
 Restart=on-failure
 RestartSec=2
-# Allow a few quick restart attempts, then give up and let OnFailure
-# restart the whole phosh stack.
-StartLimitIntervalSec=30
-StartLimitBurst=3
 
 [Install]
-WantedBy=graphical.target
+WantedBy=phosh.service
 SYSEOF
 
             # Recovery: when kaos-ui-stream can't stay up, phoc's headless
@@ -511,13 +544,18 @@ SYSEOF
 [Unit]
 Description=Recover kaos-ui-stream by restarting phosh
 After=phosh.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/systemctl restart phosh.service
 # Prevent restart storms if phosh itself is broken.
 StartLimitIntervalSec=300
 StartLimitBurst=2
+
+[Service]
+Type=oneshot
+# We are only ever triggered once kaos-ui-stream has hit its own start
+# limit; a unit in that state refuses every start request ("Start request
+# repeated too quickly") until its failure state is cleared, so the phosh
+# restart below would otherwise bring phosh back without the relay.
+ExecStartPre=-/bin/systemctl reset-failed kaos-ui-stream.service
+ExecStart=/bin/systemctl restart phosh.service
 RECOVERYEOF
 
             # /etc/phosh/phoc.ini: like phosh.service.d and the two unit
@@ -555,8 +593,17 @@ PHOCEOF
             # no headless output to capture, so skip enabling the relay
             # there.
             if [ "$EARLY_LINUX_MODE" != "1" ]; then
-                ln -sf /etc/systemd/system/kaos-ui-stream.service "$CHROOT/etc/systemd/system/graphical.target.wants/kaos-ui-stream.service" 2>/dev/null
+                # Wanted by phosh.service (not graphical.target) so every
+                # phosh start -- boot, crash recovery, manual restart --
+                # brings the relay up with it. Drop the old target symlink
+                # from earlier generations of this script.
+                rm -f "$CHROOT/etc/systemd/system/graphical.target.wants/kaos-ui-stream.service"
+                mkdir -p "$CHROOT/etc/systemd/system/phosh.service.wants"
+                ln -sf /etc/systemd/system/kaos-ui-stream.service "$CHROOT/etc/systemd/system/phosh.service.wants/kaos-ui-stream.service" 2>/dev/null
                 log "kaos-ui-stream.service enabled (headless overlay mode)"
+            else
+                rm -f "$CHROOT/etc/systemd/system/graphical.target.wants/kaos-ui-stream.service" \
+                      "$CHROOT/etc/systemd/system/phosh.service.wants/kaos-ui-stream.service"
             fi
         else
             log "SailfishOS detected — skipping phosh setup (lipstick is the SFOS compositor)"
@@ -587,10 +634,12 @@ SYSCONF
 #     libinput picks up the uinput touchscreen device for native touch events
 #   - seatd provides seat management required by libinput backend
 #   - udevd provides device enumeration required by libinput
-#   - WLR_LIBINPUT_NO_DEVICES=1: allows phoc to start before touch device exists
 #   - kaos-touch-input creates a uinput device with INPUT_PROP_DIRECT
 #     so libinput classifies it as a touchscreen (not pointer/mouse)
 #   - No zwlr_virtual_pointer — that protocol always produces cursor events
+#   - WLR_LIBINPUT_NO_DEVICES must NOT be set: it makes wlroots skip the
+#     initial libinput event drain, so the kaos-touch uinput device is never
+#     added to the seat (seat caps stay 0x0, no wl_touch reaches phosh)
 #
 # Compile kaos-touch-input from kaos-input.c:
 #   gcc -o kaos-touch-input kaos-input.c -O2
@@ -608,8 +657,7 @@ export WAYLAND_DISPLAY=wayland-0
 export WLR_BACKENDS=headless,libinput
 export WLR_RENDERER=vulkan
 export LIBSEAT_BACKEND=seatd
-# Allow phoc to start even if no input devices are present yet
-export WLR_LIBINPUT_NO_DEVICES=1
+# NOTE: no WLR_LIBINPUT_NO_DEVICES here — see design decisions above.
 # GPU rendering: Turnip Vulkan driver via KGSL (Adreno 630)
 export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
 export VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
@@ -625,7 +673,6 @@ if [ -f /tmp/.linux_mode ]; then
     export WLR_BACKENDS=drm,libinput
     export WLR_DRM_DEVICES=/dev/dri/card0
     export WLR_DRM_NO_MODIFIERS=1
-    unset WLR_LIBINPUT_NO_DEVICES
 fi
 
 hostname kaos 2>/dev/null || true
@@ -1226,12 +1273,14 @@ setup_kaos_touch() {
 I:$(date +%s)
 E:ID_INPUT=1
 E:ID_INPUT_TOUCHSCREEN=1
+E:WL_OUTPUT=HEADLESS-1
 G:seat
 V:1
 UDEVEOF
                 cat > "/run/udev/data/+input:input${INPUTNUM}" << UDEVEOF
 E:ID_INPUT=1
 E:ID_INPUT_TOUCHSCREEN=1
+E:WL_OUTPUT=HEADLESS-1
 G:seat
 V:1
 UDEVEOF
@@ -1467,7 +1516,27 @@ NSEOF
     chmod +x "$CHROOT/usr/local/sbin/ns-entry.sh"
 
     mkdir -p "$CHROOT/var/log"
-    runcon u:r:su:s0 $UNSHARE_BIN $UNSHARE_FLAGS -- /system/bin/chroot "$CHROOT" /usr/local/sbin/ns-entry.sh > "$CHROOT/var/log/namespace-boot.log" 2>&1 &
+    # -R (not a separate /system/bin/chroot call) so this process ends up as
+    # the actual root of its own (private, per unshare_kaos's MS_PRIVATE
+    # above) mount namespace, not merely chroot(2)ed into a bind mount
+    # sitting under Android's root. A plain chroot() leaves current->fs->root
+    # pointing at $CHROOT while the mount namespace's own root mount is still
+    # Android's "/" -- the kernel's current_chrooted() (kernel/
+    # user_namespace.c, checked by create_user_ns()) sees that mismatch and
+    # denies unshare(CLONE_NEWUSER) to every process inside, root included.
+    # Confirmed live 2026-09-14: `unshare --user` failed EPERM for both
+    # phosh and root in the running namespace, no SELinux denial logged --
+    # this is what silently broke bubblewrap (so e.g. epiphany's sandboxed
+    # WebKit process could never launch) and forced upower.service into an
+    # unsandboxed PrivateUsers=no workaround. -R does chdir($CHROOT) ->
+    # MS_MOVE onto "/" -> chroot(".") -> chdir("/"), the same sequence
+    # system/extras/multirom/trampoline/trampoline.c's hybridos_switch_root()
+    # already uses for the (harder, full-teardown) cold-boot case; here
+    # $CHROOT is a single leaf bind mount, not Android's real "/" with 100+
+    # mounts under it, so the move is a simple one-mount re-parent that
+    # leaves Android's own mounts reachable-but-hidden underneath, same as
+    # a plain chroot() would.
+    runcon u:r:su:s0 $UNSHARE_BIN $UNSHARE_FLAGS -R "$CHROOT" -- /usr/local/sbin/ns-entry.sh > "$CHROOT/var/log/namespace-boot.log" 2>&1 &
     MAIN_PID=$!
 
     sleep 1
@@ -1477,7 +1546,14 @@ NSEOF
     fi
 
     # Start the Virtual Touch Input Daemon
-    runcon u:r:su:s0 /system/bin/kaos-touch-input &
+    # Ensure /dev/uinput is world-writable and root-owned so the daemon can
+    # open it regardless of stock Android's uhid:uhid 660 ownership/SELinux.
+    # (This is the Android host /dev/uinput, not the namespace's.)
+    if [ -c /dev/uinput ]; then
+        chown root:root /dev/uinput 2>/dev/null || true
+        chmod 666 /dev/uinput 2>/dev/null || true
+    fi
+    runcon u:r:su:s0 /system/bin/kaos-touch-input > "$CHROOT/var/log/kaos-touch-input.log" 2>&1 &
     echo $! > "$INPUT_PID_FILE"
 
     # Start the SurfaceFlinger display bridge — only relevant in headless
