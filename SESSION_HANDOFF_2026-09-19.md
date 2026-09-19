@@ -30,11 +30,16 @@ before starting the child; `clone3` doesn't). Result: every `CLONE_SETTLS` child
 bogus `tpidr_el0`, touching TLS (stack canaries, errno, pthread keys) segfaults
 deterministically.
 
-**Fix (uncommitted working tree, kernel/xiaomi/sdm845):**
+**Fix — COMMITTED post-handoff (`kernel/xiaomi/sdm845`):**
 - `arch/arm64/kernel/process.c`: `copy_thread()` → `copy_thread_tls(..., unsigned long tls)` and
   use `tls` when `CLONE_SETTLS` is set.
 - `arch/arm64/Kconfig`: `select HAVE_COPY_THREAD_TLS`.
-- `init/Kconfig`: add `config HAVE_COPY_THREAD_TLS` (guarded/traditional arm64 config).
+- Commits: `442a704bff44` ("arm64: fix clone3 TLS loss via HAVE_COPY_THREAD_TLS", process.c +
+  arm64 Kconfig) and `8be4262379d9` ("arm64: drop duplicate HAVE_COPY_THREAD_TLS from
+  init/Kconfig") — the `init/Kconfig` block was a **redundant duplicate** and was dropped; the
+  symbol is defined once in `arch/Kconfig` (`config HAVE_COPY_THREAD_TLS` at arch/Kconfig:748)
+  and the arch just `select`s it, same as x86. Final fix = **2 files**, not the 3 listed at
+  handoff time.
 
 Verified end-to-end live after user rebuilt and flashed the boot image:
 ```
@@ -114,30 +119,43 @@ to `ro` at next reboot.
 
 ## 5. Current on-device state (as of session end)
 
-- Kernel: `4.9.337-perf-g14b5abc69cf5-dirty` (clone3 TLS fix flashed). Fix **uncommitted** in
-  `kernel/xiaomi/sdm845` (`arch/arm64/kernel/process.c`, `arch/arm64/Kconfig`, `init/Kconfig`).
+- Kernel: `4.9.337-perf-g14b5abc69cf5-dirty` (clone3 TLS fix flashed). Fix **committed** in
+  `kernel/xiaomi/sdm845` (`442a704bff44` + `8be4262379d9` — see §1). Verified live at closeout:
+  `CONFIG_HAVE_COPY_THREAD_TLS=y` in `/proc/config.gz`, `copy_thread_tls` exported in
+  `/proc/kallsyms`.
 - `distros.conf`: `ubuntu` active (full `noble`, rebuild from `2026-09-18 20:39` rootfs),
   `sailfish` installed, `kali-bare` installed, others available. `active` symlink → `ubuntu`.
 - Namespace: currently **stopped/clean** (final poweroff test left it down; `reap`-clean, no stale
-  mounts, no orphan daemons). `/data/rootfs` unmounted.
+  mounts, no orphan daemons). `/data/rootfs` unmounted. Re-verified at closeout: no `kaos-*`
+  processes, no stowaway/`/data/rootfs` mounts.
 - WiFi: 12 networks configured in distro wpa_supplicant; last connect `Kamstarlink`,
   `192.168.1.38`.
-- `kaos-service` + `distros-lib.sh` hot-deployed with watchdog/reap/`distro_umount` fixes.
+- `kaos-service` + `distros-lib.sh` watchdog/reap/`distro_umount` fixes: **committed + deployed.**
+  On-device `/system/bin/{kaos-service,distros-lib.sh,kaos-starter}` and
+  `/system/etc/distros.conf` all md5-identical to git HEAD at closeout; `reap` subcommand present.
 - SSH pattern unchanged: `adb forward tcp:2223 tcp:22`; key-based `root@127.0.0.1` (`id_ed25519.pub`).
 
-## 6. Suggested next steps
+## 6. Suggested next steps — ALL CLOSED as of 2026-09-19 closeout
 
-1. **Commit + bake the clone3 TLS fix** (§1). Verify the three files are complete
-   (`process.c`, `arch/arm64/Kconfig`, `init/Kconfig`) and craft a message in the repo's style.
-2. **Fold the watchdog/reap work into the ROM build** (not just hot-deployed): `kaos-service` +
-   `distros-lib.sh` changes live in `/system/bin/` on-device; a fresh flash would lose them.
-3. Consider wiring `kaos-starter`'s `/sbin/chroot` fix (§3 of yesterday) into this push too, so the
-   next full build carries all three.
-4. Leave `remount,rw /` as a documented dev convenience or normalize `/` back to `ro` after next
-   deploy (one-liner either way — noted in §4).
-5. If the container poweroff path is exercised again, the watchdog should now keep the host clean
-   without a `reap`; anything that re-adds fixed-string unmount lists should be viewed with
-   suspicion (dynamic `/proc/mounts` sweep is strictly more robust).
+1. ✅ **Commit + bake the clone3 TLS fix** (§1). `442a704bff44` (`process.c`, `arch/arm64/Kconfig`
+   `select HAVE_COPY_THREAD_TLS`) + `8be4262379d9` (dropped the duplicate `init/Kconfig` block —
+   symbol lives in `arch/Kconfig`). Flashed kernel confirmed via `/proc/config.gz` +
+   `/proc/kallsyms`.
+2. ✅ **Fold the watchdog/reap work into the ROM build.** `kaos/scripts/kaos-service` (+169) and
+   `kaos/scripts/distros-lib.sh` (+26) committed in `7a70ad6`; `kaos/kaos.mk:18,24` already copy
+   both to `/system/bin/` and `/system/etc/` (well, `distros.conf`; lib+service → `/system/bin/`),
+   so a fresh flash carries them. Md5 of deployed `/system/bin/*` == git HEAD.
+3. ✅ **`kaos-starter`'s `/sbin/chroot` fix folded in.** Committed `644501d`; `kaos.mk:19` ships it
+   to `/system/bin/kaos-starter`. Live-verified identical on-device.
+4. ⏺ `remount,rw /`: left as the documented dev convenience (one-liner either way, §4). No action
+   taken — intentional.
+5. ✅ Watchdog end-to-end (start → poweroff → auto-teardown) re-exercised by user live at
+   closeout; host stays clean without `reap`. Fixed-string unmount lists remain verboten — the
+   dynamic `/proc/mounts` sweep is the only sanctioned approach.
+
+Additional from §7: `dce6ad3e7644` (gitignore) — `out/` and `firebase-debug.log` now ignored, so
+the "junk, never commit" items are handled. `kernel/cgroup.c` + `include/linux/cgroup-defs.h`
+remain intentionally uncommitted (do not touch). `device/xiaomi/perseus` clean.
 
 ## 7. Kernel cleanup (post-handoff)
 
