@@ -1459,10 +1459,38 @@ fi
 # tools, SSH, etc.) a simple idle loop keeps the namespace alive while users
 # interact via nsenter/login.
 INIT=""
-if [ "$DISTRO_ID" = "kali" ]; then
-    # /sbin/preinit is for HybridOS boot handoff. In namespace mode we want the
-    # existing namespace init path, not the boot wrapper.
-    CANDIDATES="/usr/local/sbin/kaos-init /sbin/init /usr/lib/systemd/systemd /sbin/preinit"
+# Fixed 2026-09-17: this used to key the whole candidate order off
+# "$DISTRO_ID = kali" alone, putting kaos-init first for *any* rootfs
+# literally named kali -- a leftover from the old NetHunter-style
+# kali_native/kali_pro chroots, which had no real systemd and genuinely
+# needed kaos-init to bring up Phosh/Wayland at all. It doesn't distinguish
+# those from a plain kaos-configs-built kali rootfs (hybris/kaos-configs/
+# build-rootfs.sh --distro kali), which DOES have real systemd -- /etc/
+# os-release's ID=kali is identical for both, so DISTRO_ID can't tell them
+# apart, but INIT_IS_SYSTEMD (computed above, per-rootfs, from the actual
+# /sbin/init symlink) already can. Confirmed live: this made a genuine
+# systemd install on a freshly deployed kali distro get PID 1 handed to
+# kaos-init instead -- all the systemd unit configuration Phase 4/Configure
+# step had just written (phosh.service.d, kaos-ui-stream.service, etc.)
+# was silently dead code, dbus-daemon crash-looped under kaos-init's own
+# manual startup, and phoc/phosh never actually started.
+# /sbin/preinit never belongs in either list below: it's the "HybridOS boot
+# handoff" wrapper kaos-chroot-install installs into every Kali rootfs
+# regardless of style (its own comment calls it "Minimal HybridOS boot
+# wrapper: PID 1"), meant only for multirom.c's separate switch_root
+# cold-boot flow (system/extras/multirom/multirom.c's own kInitCandidates,
+# a completely different binary from this script). ns-entry.sh only ever
+# runs for kaos-service's namespace/overlay mode, never switch_root, so
+# preinit is never the right choice here. Confirmed live 2026-09-17: once
+# kaos-init-first was fixed for a systemd-based kali rootfs (see the
+# 2026-09-17 comment below), the generic ordering's "/sbin/preinit" being
+# first still picked it over real systemd (/sbin/init), because
+# kaos-chroot-install's restore step drops that same preinit script into
+# every kali install unconditionally -- it isn't specific to the old
+# non-systemd NetHunter-style chroots this candidate list was originally
+# written around.
+if [ "$DISTRO_ID" = "kali" ] && [ "$INIT_IS_SYSTEMD" != "1" ]; then
+    CANDIDATES="/usr/local/sbin/kaos-init /sbin/init /usr/lib/systemd/systemd"
 else
     # kaos-init is generated fresh on every start regardless of what the
     # rootfs actually has, so it always exists -- it must come AFTER real
@@ -1471,7 +1499,7 @@ else
     # HAS_CGROUP=1, the old ordering (kaos-init first) still picked kaos-init
     # every time, because the loop takes the first *existing* executable, not
     # the first capable one. Real init > our synthetic Phosh fallback.
-    CANDIDATES="/sbin/preinit /sbin/init /usr/lib/systemd/systemd /usr/local/sbin/kaos-init"
+    CANDIDATES="/sbin/init /usr/lib/systemd/systemd /usr/local/sbin/kaos-init"
 fi
 for candidate in $CANDIDATES; do
     [ -x "$candidate" ] || continue
@@ -1573,42 +1601,34 @@ NSEOF
 
     log "${DISTRO_NAME} namespace started. Host PID: $MAIN_PID"
     do_detect
+
+    # Watchdog: when namespace PID 1 exits (poweroff inside the container,
+    # crash, OOM, user SIGKILL, ...), the outer unshare wrapper ($MAIN_PID)
+    # exits too -- unshare -f waits on it. Teardown the Android-side
+    # side-effects then: helper daemons, PID files, and every mount made on
+    # behalf of the namespace (they persist in Android's mount namespace
+    # otherwise -- confirmed live 2026-09-19). Guard on the PID file still
+    # naming us so an explicit stop/restart (or PID reuse) never double-tears.
+    (
+        while [ -d "/proc/$MAIN_PID" ]; do
+            sleep 5
+        done
+        if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$MAIN_PID" ]; then
+            log "${DISTRO_NAME} namespace PID 1 exited; auto-teardown"
+            teardown_all
+            do_detect
+        fi
+    ) < /dev/null > /dev/null 2>&1 &
 }
 
-# === Stop Namespace ===
-stop_namespace() {
-    if [ ! -f "$PID_FILE" ]; then
-        log "${DISTRO_NAME} is not running (no PID file)."
-        return 1
-    fi
-
-    TARGET_PID=$(cat "$PID_FILE")
-    log "Stopping ${DISTRO_NAME} (Host PID $TARGET_PID)..."
-
-    # $TARGET_PID is the OUTER unshare_kaos wrapper (unshare -f forks and
-    # waits), not the process running as PID 1 inside the new PID namespace.
-    # Killing only the wrapper leaves the whole namespace -- kaos-init, its
-    # background monitor subshell, Phosh, touch-input, everything -- orphaned
-    # and still running, reparented to host PID 1, forever. Confirmed live
-    # 2026-08-27: two stale kaos_mainline instances survived repeated "stop"
-    # calls this exact way, continuing to write into the shared
-    # kaos-init.log for hours and making the fix look broken when it wasn't.
-    # The kernel guarantees that killing a PID namespace's own PID 1
-    # immediately SIGKILLs every other process in that namespace -- find it
-    # via /proc/<wrapper>/task/<wrapper>/children (direct child, no pgrep
-    # dependency) and kill THAT first so the whole tree goes down atomically.
-    NS_INIT_PID=$(cat "/proc/$TARGET_PID/task/$TARGET_PID/children" 2>/dev/null | awk '{print $1}')
-    if [ -n "$NS_INIT_PID" ]; then
-        log "Killing namespace PID 1 (host PID $NS_INIT_PID) to tear down the whole namespace..."
-        kill -KILL "$NS_INIT_PID" 2>/dev/null
-    fi
-
-    kill -TERM "$TARGET_PID" 2>/dev/null
-    sleep 2
-    if kill -0 "$TARGET_PID" 2>/dev/null; then
-        kill -KILL "$TARGET_PID" 2>/dev/null
-    fi
-
+# === Tear down namespace side-effects ===
+# Kills the Android-side helper daemons and unmounts every mount made on
+# behalf of the namespace. Safe to run when parts are already gone (missing
+# PID files / processes / mounts are tolerated). These mounts live in
+# ANDROID's mount namespace -- unmounting from inside the container's own
+# poweroff does NOT clear them (confirmed live 2026-09-19), so this must run
+# whenever the namespace goes away.
+teardown_all() {
     # Kill Input Daemon
     if [ -f "$INPUT_PID_FILE" ]; then
         kill -9 $(cat "$INPUT_PID_FILE") 2>/dev/null
@@ -1627,13 +1647,68 @@ stop_namespace() {
 
     rm -f "$PID_FILE"
 
-    # Unmount all chroot mounts (reverse order)
-    for m in system vendor sdcard dev/dri dev/pts dev/shm dev proc sys ""; do
-        umount -l "$CHROOT/$m" 2>/dev/null
+    # Unmount every mount under $CHROOT and $REAL_CHROOT, deepest first.
+    # Derived from /proc/mounts rather than a fixed list so no mount that
+    # do_mounts()/a distro adds (dev/socket, mnt/android-dev-socket,
+    # mnt/android-dev-snd, sailfish firmware binds, ...) survives into a
+    # stale state -- including ones made under a previously-resolved CHROOT
+    # that a newer distros-lib no longer uses (hit live 2026-09-19: binds
+    # left at /data/.stowaway/ubuntu/* after the config moved to
+    # CHROOT=/data/rootfs).
+    for _root in "$CHROOT" "$REAL_CHROOT"; do
+        [ -n "$_root" ] || continue
+        awk -v c="$_root" 'index($2, c "/") == 1 {print $2}' /proc/mounts | sort -r | \
+            while read -r t; do
+                umount -l "$t" 2>/dev/null
+            done
     done
-    # Unmount the base bind mount
+    # Unmount the base bind mount. Unconditional and lazy: mountpoint -q has
+    # proven unreliable in the bridge's execution context (reported "not a
+    # mountpoint" seconds after /proc/mounts still listed /data/rootfs atop
+    # sda22, verified live 2026-09-19), and a possibly-busy mount must not
+    # survive into a stale state.
+    runcon u:r:su:s0 umount -l "$CHROOT" 2>/dev/null || umount -l "$CHROOT" 2>/dev/null
     distro_umount
+}
 
+# Kill the running namespace tree. $PID_FILE holds the OUTER unshare_kaos
+# wrapper (unshare -f forks and waits), NOT the process running as PID 1
+# inside the new PID namespace. Killing only the wrapper leaves the whole
+# namespace -- kaos-init, its background monitor subshell, Phosh,
+# touch-input, everything -- orphaned and still running, reparented to host
+# PID 1, forever. Confirmed live 2026-08-27: two stale kaos_mainline
+# instances survived repeated "stop" calls this exact way. The kernel
+# guarantees that killing a PID namespace's own PID 1 immediately SIGKILLs
+# every other process in that namespace -- find it via
+# /proc/<wrapper>/task/<wrapper>/children (direct child, no pgrep
+# dependency) and kill THAT first so the whole tree goes down atomically.
+kill_namespace_tree() {
+    local TARGET_PID
+    [ -f "$PID_FILE" ] || return 0
+    TARGET_PID=$(cat "$PID_FILE")
+    if kill -0 "$TARGET_PID" 2>/dev/null; then
+        NS_INIT_PID=$(cat "/proc/$TARGET_PID/task/$TARGET_PID/children" 2>/dev/null | awk '{print $1}')
+        if [ -n "$NS_INIT_PID" ]; then
+            log "Killing namespace PID 1 (host PID $NS_INIT_PID) to tear down the whole namespace..."
+            kill -KILL "$NS_INIT_PID" 2>/dev/null
+        fi
+        kill -TERM "$TARGET_PID" 2>/dev/null
+        sleep 2
+        kill -0 "$TARGET_PID" 2>/dev/null && kill -KILL "$TARGET_PID" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+}
+
+# === Stop Namespace ===
+stop_namespace() {
+    if [ ! -f "$PID_FILE" ]; then
+        log "${DISTRO_NAME} is not running (no PID file)."
+        return 1
+    fi
+
+    log "Stopping ${DISTRO_NAME} (Host PID $(cat "$PID_FILE"))..."
+    kill_namespace_tree
+    teardown_all
     log "${DISTRO_NAME} namespace stopped."
     do_detect
 }
@@ -1666,6 +1741,14 @@ case "$1" in
         ;;
     mounts)
         do_mounts
+        ;;
+    reap)
+        # Recover from a namespace that died without a clean teardown (e.g.
+        # poweroff from inside the container when no watchdog was running).
+        log "${DISTRO_NAME} forcing cleanup of stale namespace side-effects"
+        kill_namespace_tree
+        teardown_all
+        log "${DISTRO_NAME} reaped."
         ;;
     detect)
         do_detect

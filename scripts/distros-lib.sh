@@ -109,6 +109,25 @@ resolve_distro() {
     DISTRO_NAME="$distro"
 
     if [ -f "$DISTROS_CONF" ]; then
+        # Guard added 2026-09-17 after a real incident: resolve_distro() used
+        # to fall through silently for a name with no matching "[$distro]"
+        # section, leaving DISTRO_PATH empty. That collapsed REAL_CHROOT to
+        # bare "${HYBRIDOS_BASE}/" (i.e. literally /data/.stowaway) in the
+        # hybridos branch below, and a caller (kaos-chroot-install's
+        # do_restore) then ran `rm -rf "$REAL_CHROOT"` on it -- wiping the
+        # entire /data/.stowaway directory (every installed distro, not just
+        # the one being installed) because it was invoked with a distro name
+        # that had never been registered in distros.conf first. Fail loudly
+        # instead of resolving to anything under HYBRIDOS_BASE/OFFICIAL_KAOS_BASE
+        # when the section genuinely doesn't exist.
+        if ! grep -q "^\[$distro\]" "$DISTROS_CONF"; then
+            echo "distros-lib: FATAL: no [$distro] section in $DISTROS_CONF -- refusing to resolve a path for it" >&2
+            DISTRO_NAME="$distro"
+            REAL_CHROOT=""
+            CHROOT=""
+            return 1
+        fi
+
         # Config exists — read distro properties
         DISTRO_TYPE=$(distro_get "$distro" "type")
         DISTRO_PATH=$(distro_get "$distro" "path")
@@ -229,7 +248,12 @@ distro_umount() {
     local target="$CHROOT"
 
     if mountpoint -q "$target" 2>/dev/null; then
-        umount "$target" 2>/dev/null
+        # A plain umount here runs in the caller's SELinux domain (toolbox),
+        # which cannot unmount a real block-device mount like the CHROOT
+        # base (verified live 2026-09-19: /data/rootfs on sda22 survived
+        # teardown until unmounted via runcon u:r:su:s0). Raise to the su
+        # domain, falling back to a plain umount for restricted hosts.
+        runcon u:r:su:s0 umount "$target" 2>/dev/null || umount "$target" 2>/dev/null
         dlog "Unmounted ${target}"
     fi
 
