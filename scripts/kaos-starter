@@ -172,7 +172,21 @@ case "$1" in
         # interactive `kaos-starter exec`/`login` shell also gets working
         # unshare(CLONE_NEWUSER) (bwrap, etc.), not just the long-running
         # init process kaos-service started.
-        exec runcon u:r:su:s0 /system/bin/busybox_kaos nsenter -t "$TARGET_PID" -m -u -i -p -- /system/bin/chroot / "$@"
+        #
+        # The chroot(1) binary itself must be /sbin/chroot (the distro's
+        # own, present on every debootstrap-based rootfs we ship), not
+        # /system/bin/chroot -- confirmed live 2026-09-17 on kali-bare:
+        # once nsenter -m has actually joined the container's mount
+        # namespace, /system/bin doesn't exist there at all (that's an
+        # Android path, not FHS), so the old hardcoded Android-side path
+        # failed with "can't execute '/system/bin/chroot': No such file or
+        # directory" -- a real, silent bug: on distros where nsenter -m
+        # failed to take effect for some other reason (e.g. a stale
+        # $TARGET_PID), /system/bin/chroot still resolves fine on
+        # Android's own root, so the command would "succeed" while
+        # actually running against Android's filesystem instead of the
+        # container's, with no visible error at all.
+        exec runcon u:r:su:s0 /system/bin/busybox_kaos nsenter -t "$TARGET_PID" -m -u -i -p -- /sbin/chroot / "$@"
         ;;
     login)
         $0 ${_DISTRO_ARG:+--distro $_DISTRO_ARG} exec "${DISTRO_SHELL:-/bin/bash}" -l
