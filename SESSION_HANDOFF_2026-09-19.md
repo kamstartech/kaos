@@ -138,3 +138,29 @@ to `ro` at next reboot.
 5. If the container poweroff path is exercised again, the watchdog should now keep the host clean
    without a `reap`; anything that re-adds fixed-string unmount lists should be viewed with
    suspicion (dynamic `/proc/mounts` sweep is strictly more robust).
+
+## 7. Kernel cleanup (post-handoff)
+
+All 12 pre-existing uncommitted kernel files (`binder`, `cgroup`, `drm`, `fts`,
+`fs/proc`, `perseus.config`) were reviewed. Findings + fixes, all on
+`lineage-22.2-nethunter` → `kamstartech`:
+
+- `d15a900ca767` binder: cmd 'b' **16 is `BINDER_ENABLE_ONEWAY_SPAM_DETECTION` in this
+  AOSP ABI** (verified across every binder.h in tree), NOT thread-pool-exhausted (that's
+  'b' 18 in newer AOSP and is not shipped). Handler renamed; no-op ack is correct
+  (4.9 lacks the feature). Also dropped the stale `CONFIG_PROVE_LOCKING=y` block
+  (dated 2026-09-15 "TEMPORARY", superseded by the proc backport).
+- `bb80b4dbc93c` proc mount_ns() backport — s_fs_info ref balance verified 1:1
+  incl. error path.
+- `e459a6b2d7a2` drm crtc_id in vblank events + `DRM_CAP_CRTC_IN_VBLANK_EVENT` (0x12).
+- `c0d3c424f79e` fts: drop redundant double `ABS_MT_TRACKING_ID -1` (core already
+  emits it on `input_mt_report_slot_state(...,0)`).
+
+**Intentionally left UNCOMMITTED (do not touch):** `kernel/cgroup.c` +
+`include/linux/cgroup-defs.h` — v2 `nsdelegate`/`memory_recursiveprot` accepted but
+no-op on 4.9; remount silently drops unlisted flags; ordered only for next visit.
+
+**Junk, never commit:** `firebase-debug.log`, `out/` (add to `.gitignore`).
+
+These are source/logic fixes only — the flashed kernel still behaves identically for
+binder (name-only change); PROVE_LOCKING removal only affects the next rebuild.
