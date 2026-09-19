@@ -111,6 +111,23 @@ do_restore() {
     # In HybridOS mode: paths are resolved by distros-lib
     EXTRACT_DIR=$(dirname "$CHROOT_DIR")
     REAL_DIR="${REAL_CHROOT}"
+
+    # Guard added 2026-09-17 after a real incident: an unregistered --distro
+    # name (never added to distros.conf first) used to make REAL_CHROOT
+    # collapse to bare HYBRIDOS_BASE/OFFICIAL_KAOS_BASE (see the matching
+    # guard in distros-lib.sh's resolve_distro()), and the "rm -rf $REAL_DIR"
+    # below then deleted the entire /data/.stowaway directory -- every
+    # installed distro, not just the one being restored. Belt-and-suspenders:
+    # refuse to touch REAL_DIR here too if it's empty or exactly equal to one
+    # of the base directories a real per-distro path is always a subdirectory
+    # of, regardless of what distros-lib.sh did or didn't catch upstream.
+    case "$REAL_DIR" in
+        ""|"$HYBRIDOS_BASE"|"$HYBRIDOS_BASE/"|"$OFFICIAL_KAOS_BASE"|"$OFFICIAL_KAOS_BASE/")
+            log "✗ REAL_CHROOT resolved to '$REAL_DIR' -- refusing to restore/clean over a stowaway base directory. Register the distro in distros.conf first."
+            exit 1
+            ;;
+    esac
+
     mkdir -p "$EXTRACT_DIR"
 
     # Clean existing chroot (unmount first, then remove real dir)
@@ -255,6 +272,15 @@ do_remove() {
 
     EXTRACT_DIR=$(dirname "$CHROOT_DIR")
     REAL_DIR="${REAL_CHROOT}"
+
+    # Same guard as do_restore() above -- see its comment for the incident
+    # this is defending against.
+    case "$REAL_DIR" in
+        ""|"$HYBRIDOS_BASE"|"$HYBRIDOS_BASE/"|"$OFFICIAL_KAOS_BASE"|"$OFFICIAL_KAOS_BASE/")
+            log "✗ REAL_CHROOT resolved to '$REAL_DIR' -- refusing to remove a stowaway base directory."
+            exit 1
+            ;;
+    esac
 
     # Unmount the mount point but keep the directory
     if grep -qs "$CHROOT_DIR " /proc/mounts; then
