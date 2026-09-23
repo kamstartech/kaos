@@ -35,6 +35,16 @@ DISTRO_MODE=""        # hybridos | official (per-distro install mode)
 DISTRO_VARIANT=""     # pro | "" — kali-pro needs cgroup delegation + full systemd
 DISTRO_OFFICIAL_PATH="" # absolute official path (empty = hybridos-only distro)
 
+# Behavior keys read from distros.conf by resolve_distro (empty = not declared;
+# see the distros.conf header for the schema). Consumed by distro_manifest().
+DISTRO_HOST_MOUNTS=""
+DISTRO_UI=""
+DISTRO_MASK_EXTRA=""
+DISTRO_INIT_PRIORITY=""
+DISTRO_KAOS_INIT=""
+DISTRO_HALIUM=""
+DISTRO_GFX=""
+
 # Resolved absolute paths
 REAL_CHROOT=""        # actual rootfs location
 CHROOT=""             # su mount point
@@ -50,10 +60,83 @@ normalize_distro_name() {
         kali-pro|kali_native|kali-native)
             echo "kali"
             ;;
+        ubuntu-touch|ubuntu_touch)
+            echo "ubuntu-touch"
+            ;;
         *)
             echo "$1"
             ;;
     esac
+}
+
+# === Distro Manifest ===
+# Resolves the effective boot behavior for the resolved distro into the
+# PROFILE_* variables. Precedence, highest first:
+#   1. distros.conf behavior keys (host_mounts/ui/mask_extra/init_priority/
+#      kaos_init/halium) read by resolve_distro — only when declared
+#   2. per-distro profile file distro-profiles/<normalized-name>.sh
+#   3. generic profile defaults (distro-profiles/generic.sh)
+# A section that declares no behavior keys keeps its profile-file behavior, and
+# an unknown distro with no profile file gets the generic defaults, so absence
+# of any of these is always safe.
+# Usage: distro_manifest   (uses DISTRO_NAME + DISTRO_* behavior keys)
+distro_manifest() {
+    local profile_dir="${DISTRO_PROFILE_DIR:-/system/etc/kaos/distro-profiles}"
+
+    # 1. Generic defaults, then overlay <normalized-name>.sh if present.
+    #    Reset every call so a stale profile never leaks across distros.
+    PROFILE_MOUNTS_HOST=""
+    PROFILE_UI="phosh"
+    PROFILE_KAOS_INIT="1"
+    PROFILE_MASK_EXTRA=""
+    PROFILE_PRESERVE_HAL="0"
+    PROFILE_INIT_PRIORITY=""
+    PROFILE_INSTALL_WRAPPERS="0"
+    PROFILE_HALIUM="0"
+    PROFILE_GFX="mesa"
+
+    [ -f "$profile_dir/generic.sh" ] && . "$profile_dir/generic.sh"
+    [ -n "$DISTRO_NAME" ] && [ -f "$profile_dir/${DISTRO_NAME}.sh" ] && \
+        . "$profile_dir/${DISTRO_NAME}.sh"
+
+    # 2. distros.conf behavior keys override the profile file when declared
+    #    (empty key = not declared = keep the profile/default value).
+    [ -n "$DISTRO_HOST_MOUNTS" ]   && PROFILE_MOUNTS_HOST="$DISTRO_HOST_MOUNTS"
+    [ -n "$DISTRO_UI" ]            && PROFILE_UI="$DISTRO_UI"
+    [ -n "$DISTRO_MASK_EXTRA" ]    && PROFILE_MASK_EXTRA="$DISTRO_MASK_EXTRA"
+    [ -n "$DISTRO_INIT_PRIORITY" ] && PROFILE_INIT_PRIORITY="$DISTRO_INIT_PRIORITY"
+    [ -n "$DISTRO_KAOS_INIT" ]     && PROFILE_KAOS_INIT="$DISTRO_KAOS_INIT"
+    [ -n "$DISTRO_HALIUM" ]        && PROFILE_HALIUM="$DISTRO_HALIUM"
+    [ -n "$DISTRO_GFX" ]           && PROFILE_GFX="$DISTRO_GFX"
+
+    # 3. Legacy compatibility: confs that still declare type=halium (rather than
+    #    a behavior key) keep the Halium behavior — no host partition binds and
+    #    the systemd-unified-cgroup cmdline override.
+    if [ "$DISTRO_TYPE" = "halium" ]; then
+        PROFILE_HALIUM="1"
+        PROFILE_MOUNTS_HOST=""
+    fi
+}
+
+# Back-compat alias: older callers still invoke load_distro_profile.
+load_distro_profile() { distro_manifest; }
+
+# Convenience: resolve the manifest for a distro name without a resolve_distro()
+# call. No conf behavior keys are available here, so the profile-file fallback
+# applies (the caller's resolved behavior keys are saved/restored around it).
+load_distro_profile_for() {
+    local saved="$DISTRO_NAME"
+    local s_hm="$DISTRO_HOST_MOUNTS" s_ui="$DISTRO_UI" s_me="$DISTRO_MASK_EXTRA"
+    local s_ip="$DISTRO_INIT_PRIORITY" s_ki="$DISTRO_KAOS_INIT" s_hl="$DISTRO_HALIUM"
+    local s_gfx="$DISTRO_GFX"
+    DISTRO_NAME="$(normalize_distro_name "$1")"
+    DISTRO_HOST_MOUNTS=""; DISTRO_UI=""; DISTRO_MASK_EXTRA=""
+    DISTRO_INIT_PRIORITY=""; DISTRO_KAOS_INIT=""; DISTRO_HALIUM=""; DISTRO_GFX=""
+    distro_manifest
+    DISTRO_NAME="$saved"
+    DISTRO_HOST_MOUNTS="$s_hm"; DISTRO_UI="$s_ui"; DISTRO_MASK_EXTRA="$s_me"
+    DISTRO_INIT_PRIORITY="$s_ip"; DISTRO_KAOS_INIT="$s_ki"; DISTRO_HALIUM="$s_hl"
+    DISTRO_GFX="$s_gfx"
 }
 
 # === INI Parser ===
@@ -108,6 +191,16 @@ resolve_distro() {
     distro="$(normalize_distro_name "${1:-$(distro_active)}")"
     DISTRO_NAME="$distro"
 
+    # Behavior keys: reset every resolve so a stale value never leaks across
+    # distros; empty means "not declared" (see distro_manifest).
+    DISTRO_HOST_MOUNTS=""
+    DISTRO_UI=""
+    DISTRO_MASK_EXTRA=""
+    DISTRO_INIT_PRIORITY=""
+    DISTRO_KAOS_INIT=""
+    DISTRO_HALIUM=""
+    DISTRO_GFX=""
+
     if [ -f "$DISTROS_CONF" ]; then
         # Guard added 2026-09-17 after a real incident: resolve_distro() used
         # to fall through silently for a name with no matching "[$distro]"
@@ -141,6 +234,15 @@ resolve_distro() {
         DISTRO_MODE=$(distro_get "$distro" "mode")
         DISTRO_VARIANT=$(distro_get "$distro" "variant")
         DISTRO_OFFICIAL_PATH=$(distro_get "$distro" "official_path")
+
+        # Behavior keys (optional; empty when the section omits them)
+        DISTRO_HOST_MOUNTS=$(distro_get "$distro" "host_mounts")
+        DISTRO_UI=$(distro_get "$distro" "ui")
+        DISTRO_MASK_EXTRA=$(distro_get "$distro" "mask_extra")
+        DISTRO_INIT_PRIORITY=$(distro_get "$distro" "init_priority")
+        DISTRO_KAOS_INIT=$(distro_get "$distro" "kaos_init")
+        DISTRO_HALIUM=$(distro_get "$distro" "halium")
+        DISTRO_GFX=$(distro_get "$distro" "gfx")
 
         # Defaults
         : "${DISTRO_TYPE:=directory}"

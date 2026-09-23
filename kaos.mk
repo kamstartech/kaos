@@ -32,6 +32,19 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/scripts/kali-hybridos-verify.service:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/systemd/kali-hybridos-verify.service \
     $(LOCAL_PATH)/scripts/sailfish-fixup.sh:$(TARGET_COPY_OUT_SYSTEM)/bin/sailfish-fixup.sh
 
+# Kaos distro profiles → /system/etc/kaos/distro-profiles/
+# Loaded by distros-lib.sh:load_distro_profile using the DISTRO_NAME key.
+# generic.sh is always sourced first; <name>.sh overlays it. Add a new
+# distro by dropping <name>.sh here + a distros.conf section (Phase 2 makes
+# distros.conf itself the source of truth; these files become generated
+# examples then).
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/scripts/distro-profiles/generic.sh:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/distro-profiles/generic.sh \
+    $(LOCAL_PATH)/scripts/distro-profiles/kali.sh:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/distro-profiles/kali.sh \
+    $(LOCAL_PATH)/scripts/distro-profiles/sailfish.sh:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/distro-profiles/sailfish.sh \
+    $(LOCAL_PATH)/scripts/distro-profiles/droidian.sh:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/distro-profiles/droidian.sh \
+    $(LOCAL_PATH)/scripts/distro-profiles/ubuntu-touch.sh:$(TARGET_COPY_OUT_SYSTEM)/etc/kaos/distro-profiles/ubuntu-touch.sh
+
 # Kaos native binaries built from source in scripts/Android.mk
 PRODUCT_PACKAGES += \
     kaos \
@@ -58,6 +71,31 @@ PRODUCT_PACKAGES += \
     libis_compat_layer \
     libcamera_compat_layer \
     libmedia_compat_layer
+
+# droid_hal_init (system/core/init's HYBRIS_BUILD/SYSTEMD_SELINUX variant,
+# hybris/hybris-boot/Android.mk's HYBRIS_INIT_TARGETS) -- same class of bug
+# as the compat-layer entries above: builds fine into out/ but was never
+# declared as a PRODUCT_PACKAGES entry, so it never reached the flashed
+# system.img (confirmed live 2026-09-22: builds at
+# out/target/product/perseus/system/bin/droid-hal-init, but
+# /system/bin/droid-hal-init does not exist on device). This is the real
+# Android init binary -- proper apexd/property-service/service-manager
+# semantics, not a hand-rolled shell reimplementation -- and it is what
+# actually gets WLAN (and everything else init.rc declares: qrtr-ns,
+# pd-mapper, cnss-daemon, ...) working for SailfishOS's cold boot today
+# (hybris/droid-configs/sparse/usr/bin/droid/droid-hal-startup.sh execs
+# /sbin/droid-hal-init; TODO-sfos-verification.md's WiFi entry confirms
+# `iw wlan0 link` showed a working AP association because of it). Shipping
+# it on the shared system partition (rather than per-distro, as SailfishOS's
+# own RPM packaging does today) means every distro's cold boot can reach it
+# through the same /system bind-mount kaos.init already sets up, with one
+# build producing one artifact instead of N per-rootfs copies to keep in
+# sync. Its ELF interpreter is /system/bin/bootstrap/linker64 -- a separate,
+# non-APEX bootstrap copy that already exists on the real system partition
+# (confirmed live) specifically so init-class binaries don't need apexd to
+# have already run before they can even start.
+PRODUCT_PACKAGES += \
+    droid_hal_init
 
 # android.frameworks.vr.composer@1.0 -- transitive dependency of
 # libhwc2_compat_layer, same missing-PRODUCT_PACKAGES gap as above. Also

@@ -11,7 +11,7 @@
 - **Safe Seeding:** [distros.conf](file:///home/jimmy/hadk/kaos/scripts/distros.conf) copies must check `[ -f ... ]` to avoid wiping user registry changes.
 - **Data Encryption Bypass:** Any directory under `/data/` that is needed before FBE keys are unlocked (e.g. `/data/.stowaway`) must be declared with `encryption=None`.
 - **Bridge Context:** The bridge service must maintain the `seclabel u:r:init:s0` directive.
-- **Dynamic Partition Detection:** In SailfishOS, partition block paths are detected dynamically at runtime using `droid-mount-setup.service` to map system/vendor/product partitions under `/run/droid/`.
+- **Dynamic Partition Detection:** Android partition block paths are resolved at boot by the `/kaos.init` hook (`hybris/droid-configs/sparse/kaos.init`, run by the trampoline before init handoff), which populates `/run/droid/*` for the native `.mount` units. The old `droid-mount-setup.service` was removed 2026-08-17 — do not reintroduce `Requires=`/`After=droid-mount-setup.service` into the `.mount` units or `droid-hal-prepare.service`.
 
 ## Working Here
 
@@ -32,6 +32,19 @@ Verify namespace after service changes:
 adb shell "cat /data/.stowaway/kali/var/log/ns-entry.log | tail -20"
 ```
 
+## Session Handoffs
+
+Dated handoff notes from prior sessions live in this directory. **Read the latest before working
+here** — several changes only make sense together:
+
+- [SESSION_HANDOFF_2026-09-21.md](file:///home/jimmy/hadk/kaos/SESSION_HANDOFF_2026-09-21.md) —
+  unify-distro-support-engine tasks landed, `/kaos.init` cold-boot adapter, single-namespace guard,
+  ubuntu cold-boot bring-up + the KGSL↔DRM/Halium graphics decision.
+- [SESSION_HANDOFF_2026-09-19.md](file:///home/jimmy/hadk/kaos/SESSION_HANDOFF_2026-09-19.md) —
+  clone3/TLS kernel fix, namespace teardown watchdog + `reap`.
+- [SESSION_HANDOFF_2026-09-18.md](file:///home/jimmy/hadk/kaos/SESSION_HANDOFF_2026-09-18.md)
+- [SESSION_HANDOFF_2026-09-16.md](file:///home/jimmy/hadk/kaos/SESSION_HANDOFF_2026-09-16.md)
+
 ## Key Files
 
 | File | Purpose |
@@ -41,7 +54,11 @@ adb shell "cat /data/.stowaway/kali/var/log/ns-entry.log | tail -20"
 | [kaos-starter](file:///home/jimmy/hadk/kaos/scripts/kaos-starter) | Command-line client for namespaces. |
 | [kaos-chroot-install](file:///home/jimmy/hadk/kaos/scripts/kaos-chroot-install) | Helper for extracting distribution tarballs. |
 | [distros.conf](file:///home/jimmy/hadk/kaos/scripts/distros.conf) | INI-based registry of installed distributions. |
-| [distros-lib.sh](file:///home/jimmy/hadk/kaos/scripts/distros-lib.sh) | Shell script library to parse `distros.conf`. |
+| [distros-lib.sh](file:///home/jimmy/hadk/kaos/scripts/distros-lib.sh) | Shell script library to parse `distros.conf`; `resolve_distro` + `distro_manifest` (conf keys > profile file > generic). |
+| [distro-profiles/](file:///home/jimmy/hadk/kaos/scripts/distro-profiles/) | Per-distro `PROFILE_*` modules (fallback/example set; `distros.conf` behavior keys are authoritative). |
+| [device.conf](file:///home/jimmy/hadk/kaos/scripts/device.conf) | Device hardware declaration (DRM nodes/majors, display size, Mesa/KGSL prefix); sourced by `kaos-service` and `/kaos.init`. |
+| [kaos-init-drift-check.sh](file:///home/jimmy/hadk/kaos/scripts/kaos-init-drift-check.sh) | Byte-identity guard between the `/kaos.init` oracle and its `res/raw` mirror. |
+| /kaos.init | Cold-boot adapter (`hybris/droid-configs/sparse/kaos.init`): dm-node refresh + feature-detected `adapt_boot` (SELinux, DRM nodes, phosh wiring; skips sailfish). Runs from the trampoline before init handoff. |
 | [sailfish-fixup.sh](file:///home/jimmy/hadk/kaos/scripts/sailfish-fixup.sh) | DEPRECATED (July 2026) — do not run. Rootfs is built for perseus; the script's Mesa/eglfs compositor rewrite clobbers the hwcomposer QPA display config. No longer invoked by kaos-service. |
 | [kali-preinit](file:///home/jimmy/hadk/kaos/scripts/kali-preinit) | Early boot wrapper (PID 1) within the Kali namespace. |
 | [kali-compat-init](file:///home/jimmy/hadk/kaos/scripts/kali-compat-init) | Fallback PID 1 loop for kernel 4.9. |

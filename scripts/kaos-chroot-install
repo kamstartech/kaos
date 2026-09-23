@@ -17,6 +17,7 @@ fi
 # === Parse --distro flag ===
 parse_distro_flag "$@"
 resolve_distro "${_DISTRO_ARG}"
+distro_manifest
 set -- $_REMAINING_ARGS
 
 # === Configuration (resolved by distros-lib) ===
@@ -38,7 +39,7 @@ log() {
 }
 
 install_kali_boot_wrappers() {
-    [ "$DISTRO_NAME" = "kali" ] || return 0
+    [ "$PROFILE_INSTALL_WRAPPERS" = "1" ] || return 0
     [ -d "$REAL_CHROOT" ] || return 1
 
     mkdir -p "$REAL_CHROOT/sbin" \
@@ -90,6 +91,19 @@ install_kali_boot_wrappers() {
         "$REAL_CHROOT/etc/systemd/system/kali-hybridos.target.wants/kali-hybridos-verify.service" || return 1
 
     log "✓ Kali boot wrappers installed"
+}
+
+# Post-extract distro wiring, driven entirely by the resolved manifest
+# (distro_manifest: distros.conf behavior keys > profile file > generic).
+# Currently the only declared post-extract hook is the PID1 boot-wrapper
+# install, gated by PROFILE_INSTALL_WRAPPERS; distros that declare no wiring
+# are a no-op. New per-distro unit/hook wiring should be added here as
+# manifest-gated cases rather than as distro-name hardcodes.
+install_post_extract_hooks() {
+    if [ "$PROFILE_INSTALL_WRAPPERS" = "1" ]; then
+        install_kali_boot_wrappers || return 1
+    fi
+    return 0
 }
 
 do_restore() {
@@ -248,7 +262,7 @@ nameserver 8.8.4.4
 DNSEOF
     echo "${DISTRO_HOSTNAME}" > "$FOUND_DIR/etc/hostname"
 
-    install_kali_boot_wrappers || {
+    install_post_extract_hooks || {
         log "ERROR: failed to install Kali boot wrappers"
         exit 1
     }
@@ -368,7 +382,7 @@ do_auto_install() {
     local shell_name=$(basename "${DISTRO_SHELL:-/bin/bash}")
 
     if [ -d "$CHROOT_PATH" ] && [ -f "$CHROOT_PATH/etc/os-release" ] && [ -f "$CHROOT_PATH/bin/$shell_name" ]; then
-        install_kali_boot_wrappers || {
+        install_post_extract_hooks || {
             log "ERROR: failed to refresh Kali boot wrappers"
             exit 1
         }

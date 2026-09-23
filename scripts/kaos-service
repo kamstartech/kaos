@@ -15,9 +15,31 @@ else
     exit 1
 fi
 
+# === Load device declaration (hardware constants; see device.conf) ===
+# Values default to perseus so a missing declaration is a no-op.
+DEVICE_CONF="${SCRIPT_DIR}/device.conf"
+[ -f "$DEVICE_CONF" ] || DEVICE_CONF="/system/etc/kaos/device.conf"
+[ -f "$DEVICE_CONF" ] && . "$DEVICE_CONF"
+: "${DEV_DRM_CARD_MAJOR:=226}"
+: "${DEV_DRM_CARD_MINOR:=0}"
+: "${DEV_DRM_RENDER_MAJOR:=226}"
+: "${DEV_DRM_RENDER_MINOR:=128}"
+: "${DEV_DRM_CARD:=/dev/dri/card0}"
+: "${DEV_DRM_RENDER:=/dev/dri/renderD128}"
+: "${DEV_DISPLAY_SIZE:=1080x2340}"
+: "${DEV_MESA_KGSL:=/usr/local/mesa-kgsl}"
+export DEV_DRM_CARD_MAJOR DEV_DRM_CARD_MINOR DEV_DRM_RENDER_MAJOR DEV_DRM_RENDER_MINOR \
+       DEV_DRM_CARD DEV_DRM_RENDER DEV_DISPLAY_SIZE DEV_MESA_KGSL
+
 # === Parse --distro flag ===
 parse_distro_flag "$@"
 resolve_distro "${_DISTRO_ARG}"
+distro_manifest
+# Export the resolved profile so the ns-entry.sh child (exec'd under
+# unshare/chroot below) inherits the distro's declared boot behavior.
+export PROFILE_MOUNTS_HOST PROFILE_UI PROFILE_KAOS_INIT PROFILE_MASK_EXTRA \
+       PROFILE_PRESERVE_HAL PROFILE_INIT_PRIORITY PROFILE_INSTALL_WRAPPERS \
+       PROFILE_HALIUM
 set -- $_REMAINING_ARGS
 
 # === Configuration (resolved by distros-lib) ===
@@ -118,10 +140,13 @@ do_mounts() {
         runcon u:r:su:s0 mount -o bind /dev/snd "$CHROOT/mnt/android-dev-snd" 2>/dev/null
     fi
 
-    # SailfishOS needs firmware paths bind-mounted from Android host
-    if [ -f "$REAL_CHROOT/etc/os-release" ] && grep -q 'sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null; then
-        log "SailfishOS detected — mounting firmware paths"
-        for fw in vendor/firmware_mnt vendor/dsp vendor/bt_firmware mnt/vendor/persist; do
+    # Distro-specific host binds: driven by the loaded profile's
+    # PROFILE_MOUNTS_HOST (sailfish: firmware/system_root/linkerconfig/
+    # configfs/droid-hal). Non-empty only for a profile that declares them,
+    # so generic/kali/droidian/UT take the empty fast path unconditionally.
+    if [ -n "$PROFILE_MOUNTS_HOST" ]; then
+        log "Profile ${DISTRO_NAME} — mounting firmware paths"
+        for fw in $PROFILE_MOUNTS_HOST; do
             if [ -d "/$fw" ]; then
                 [ ! -d "$CHROOT/$fw" ] && mkdir -p "$CHROOT/$fw"
                 if ! grep -qs "$CHROOT/$fw " /proc/mounts; then
@@ -208,16 +233,44 @@ do_detect() {
 }
 
 # === Start Namespace ===
-start_namespace() {
-    # Check if already running
-    if [ -f "$PID_FILE" ]; then
-        if kill -0 $(cat "$PID_FILE") 2>/dev/null; then
-            log "${DISTRO_NAME} namespace already running (PID $(cat $PID_FILE))."
-            return 1
-        else
-            rm "$PID_FILE"
+# Returns "<distro> <pid>" for a live namespace of ANY distro, or empty if
+# none is running. Namespace PID files are kaos-<distro>.pid; the helper
+# daemon PID files (kaos-input.pid, kaos-display-bridge.pid) are global and
+# deliberately excluded.
+running_namespace() {
+    for _pf in /data/local/tmp/kaos-*.pid; do
+        [ -f "$_pf" ] || continue
+        case "$_pf" in
+            *kaos-input.pid|*kaos-display-bridge.pid) continue ;;
+        esac
+        _pid=$(cat "$_pf" 2>/dev/null)
+        [ -n "$_pid" ] || continue
+        if kill -0 "$_pid" 2>/dev/null; then
+            _d=$(basename "$_pf" .pid); _d=${_d#kaos-}
+            echo "$_d $_pid"
+            return 0
         fi
+    done
+    return 1
+}
+
+start_namespace() {
+    # Only one namespace may run at a time. Namespace PID files are per-distro
+    # (kaos-<distro>.pid), so a per-distro check alone would let a second
+    # distro start alongside the first and clobber the global helper-daemon
+    # PID files (kaos-input.pid / kaos-display-bridge.pid), orphaning the
+    # first namespace's helpers. Refuse if ANY namespace is live.
+    if _ns=$(running_namespace); then
+        _ns_distro=${_ns%% *}; _ns_pid=${_ns##* }
+        if [ "$_ns_distro" = "$DISTRO_NAME" ]; then
+            log "${DISTRO_NAME} namespace already running (PID $_ns_pid)."
+        else
+            log "ERROR: '$_ns_distro' namespace already running (PID $_ns_pid); only one namespace may run at a time. Stop it first."
+        fi
+        return 1
     fi
+    # No live namespace; drop any stale PID file for this distro.
+    rm -f "$PID_FILE"
 
     # Verify the real rootfs exists and looks usable before mounting anything.
     if ! rootfs_ready; then
@@ -260,7 +313,7 @@ start_namespace() {
 
         # SailfishOS uses lipstick as compositor, not phosh. Skip phosh setup entirely.
         IS_SFOS=0
-        grep -q 'ID=sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null && IS_SFOS=1
+        [ "$PROFILE_UI" = "sailfish" ] && IS_SFOS=1
 
         if [ "$IS_SFOS" = "0" ]; then
             # Create phosh.service drop-in with HybridOS environment
@@ -355,6 +408,7 @@ TTYVTDisallocate=yes
 # already-diagnosed chvt race, kept masked here regardless of the above.
 ExecStartPost=
 SYSEOF
+            sed -i "s|/usr/local/mesa-kgsl|$DEV_MESA_KGSL|g; s|/dev/dri/renderD128|$DEV_DRM_RENDER|g" "$CHROOT/etc/systemd/system/phosh.service.d/kaos.conf"
 
             # seatd.service competes with logind (see LIBSEAT_BACKEND above)
             # for ownership of seat0 -- mask it the same way other
@@ -486,7 +540,7 @@ SYSEOF
             # an empty result would silently break the phoc.ini mode= line
             # below instead of just falling back to a sane default.
             DISPLAY_SIZE=$(wm size 2>/dev/null | sed -n 's/.*Physical size: *//p')
-            [ -n "$DISPLAY_SIZE" ] || DISPLAY_SIZE="1080x2340"
+            [ -n "$DISPLAY_SIZE" ] || DISPLAY_SIZE="$DEV_DISPLAY_SIZE"
 
             # DISPLAY_SIZE feeds phoc.ini's headless mode= line below; the
             # KFR1 header from kaos-ui-capture carries the real width/height/
@@ -659,9 +713,9 @@ export WLR_RENDERER=vulkan
 export LIBSEAT_BACKEND=seatd
 # NOTE: no WLR_LIBINPUT_NO_DEVICES here — see design decisions above.
 # GPU rendering: Turnip Vulkan driver via KGSL (Adreno 630)
-export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
-export VK_ICD_FILENAMES=/usr/local/mesa-kgsl/share/vulkan/icd.d/freedreno_icd.aarch64.json
-export LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib/aarch64-linux-gnu
+export WLR_RENDER_DRM_DEVICE=${DEV_DRM_RENDER:-/dev/dri/renderD128}
+export VK_ICD_FILENAMES=${DEV_MESA_KGSL:-/usr/local/mesa-kgsl}/share/vulkan/icd.d/freedreno_icd.aarch64.json
+export LD_LIBRARY_PATH=${DEV_MESA_KGSL:-/usr/local/mesa-kgsl}/lib/aarch64-linux-gnu
 export LD_PRELOAD=/usr/local/lib/kgsl_drm_shim.so
 export GBM_BACKEND=kgsl
 export GBM_BACKENDS_PATH=/usr/local/lib/gbm
@@ -671,7 +725,7 @@ LINUX_DIRECT_MODE=0
 if [ -f /tmp/.linux_mode ]; then
     LINUX_DIRECT_MODE=1
     export WLR_BACKENDS=drm,libinput
-    export WLR_DRM_DEVICES=/dev/dri/card0
+export WLR_DRM_DEVICES=${DEV_DRM_CARD:-/dev/dri/card0}
     export WLR_DRM_NO_MODIFIERS=1
 fi
 
@@ -749,11 +803,31 @@ PHOC_INI=/etc/phosh/phoc.ini
 exec phoc -v -S -C "$PHOC_INI" -E "/usr/libexec/phosh -U"
 PHOSHSESSIONEOF
 chmod +x /usr/bin/phosh-session
+sed -i "s|/usr/local/mesa-kgsl|${DEV_MESA_KGSL:-/usr/local/mesa-kgsl}|g; s|/dev/dri/renderD128|${DEV_DRM_RENDER:-/dev/dri/renderD128}|g; s|/dev/dri/card0|${DEV_DRM_CARD:-/dev/dri/card0}|g" /etc/phosh/phoc.ini /usr/share/phosh/phoc.ini /usr/bin/phosh-session
+sed -i "s|^mode = .*|mode = ${DEV_DISPLAY_SIZE:-1080x2340}|" /etc/phosh/phoc.ini /usr/share/phosh/phoc.ini
 
 # 3. Start Core Services
-/etc/init.d/dbus start > /var/log/dbus.log 2>&1
-/etc/init.d/elogind start > /var/log/elogind.log 2>&1
-/etc/init.d/ssh start > /var/log/ssh.log 2>&1
+# kaos-init is the non-systemd fallback, so feature-detect the distro's own
+# service manager instead of assuming Debian's /etc/init.d layout (Alpine/
+# OpenRC, etc.). Also try common service-name aliases (ssh vs sshd).
+start_service() {
+    _svc="$1"; _log="$2"; _alt="$3"
+    if [ -x "/etc/init.d/$_svc" ]; then
+        "/etc/init.d/$_svc" start > "$_log" 2>&1
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$_svc" start > "$_log" 2>&1 || \
+            { [ -n "$_alt" ] && rc-service "$_alt" start > "$_log" 2>&1; }
+    elif command -v service >/dev/null 2>&1; then
+        service "$_svc" start > "$_log" 2>&1
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl start "$_svc" > "$_log" 2>&1
+    else
+        echo "[kaos-init] no service manager found for $_svc" > "$_log"
+    fi
+}
+start_service dbus /var/log/dbus.log
+start_service elogind /var/log/elogind.log
+start_service ssh /var/log/ssh.log sshd
 
 # 3a. Start seatd (required by libinput backend for device access)
 mkdir -p /run
@@ -965,8 +1039,8 @@ INITEOF
     # Only enable via explicit property — never auto-detect from os-release.
     # Auto-detect was dangerous: starting a SailfishOS namespace killed Android services.
     LINUX_MODE=$(getprop persist.kaos.linux_mode)
-    if [ -f "$REAL_CHROOT/etc/os-release" ] && grep -q 'sailfishos' "$REAL_CHROOT/etc/os-release" 2>/dev/null; then
-        log "SailfishOS detected — full mode requires: setprop persist.kaos.linux_mode 1"
+    if [ "$PROFILE_UI" = "sailfish" ]; then
+        log "Sailfish profile — full mode requires: setprop persist.kaos.linux_mode 1"
     fi
     if [ "$LINUX_MODE" = "1" ]; then
         touch "$CHROOT/tmp/.linux_mode"
@@ -1186,10 +1260,10 @@ done
 # umask-derived default.
 mkdir -p /dev/dri
 chmod 0755 /dev/dri
-mknod -m 0666 /dev/dri/card0 c 226 0 2>/dev/null
-chcon u:object_r:graphics_device:s0 /dev/dri/card0 2>/dev/null
-mknod -m 0666 /dev/dri/renderD128 c 226 128 2>/dev/null
-chcon u:object_r:graphics_device:s0 /dev/dri/renderD128 2>/dev/null
+mknod -m 0666 "$DEV_DRM_CARD" c "$DEV_DRM_CARD_MAJOR" "$DEV_DRM_CARD_MINOR" 2>/dev/null
+chcon u:object_r:graphics_device:s0 "$DEV_DRM_CARD" 2>/dev/null
+mknod -m 0666 "$DEV_DRM_RENDER" c "$DEV_DRM_RENDER_MAJOR" "$DEV_DRM_RENDER_MINOR" 2>/dev/null
+chcon u:object_r:graphics_device:s0 "$DEV_DRM_RENDER" 2>/dev/null
 
 # Adreno GPU (KGSL) node -- without this, phoc's GLES2 renderer fails EGL
 # init every single start ("DRI2: failed to create screen" / "failed to
@@ -1383,11 +1457,11 @@ log "Detected OS: $DISTRO_ID ($PRETTY_NAME)"
 MASK_DIR=/run/systemd/system
 mkdir -p "$MASK_DIR"
 
-SFOS_FULL=0
-if [ "$DISTRO_ID" = "sailfishos" ] && [ -f /tmp/.linux_mode ]; then
+    SFOS_FULL=0
+    if [ "$PROFILE_UI" = "sailfish" ] && [ -f /tmp/.linux_mode ]; then
     SFOS_FULL=1
     log "SailfishOS full mode — preserving droid-hal-init for hardware access"
-fi
+    fi
 
 # Services always masked (conflict with Android host regardless of distro)
 #
@@ -1459,6 +1533,10 @@ fi
 # tools, SSH, etc.) a simple idle loop keeps the namespace alive while users
 # interact via nsenter/login.
 INIT=""
+# 2026-09-20: the candidate order is now declared per-distro as
+# PROFILE_INIT_PRIORITY (distro-profiles/<name>.sh), not keyed off the
+# rootfs's own os-release ID. The non-systemd gate below still decides
+# whether that declared order applies.
 # Fixed 2026-09-17: this used to key the whole candidate order off
 # "$DISTRO_ID = kali" alone, putting kaos-init first for *any* rootfs
 # literally named kali -- a leftover from the old NetHunter-style
@@ -1489,8 +1567,8 @@ INIT=""
 # every kali install unconditionally -- it isn't specific to the old
 # non-systemd NetHunter-style chroots this candidate list was originally
 # written around.
-if [ "$DISTRO_ID" = "kali" ] && [ "$INIT_IS_SYSTEMD" != "1" ]; then
-    CANDIDATES="/usr/local/sbin/kaos-init /sbin/init /usr/lib/systemd/systemd"
+if [ "$INIT_IS_SYSTEMD" != "1" ] && [ -n "$PROFILE_INIT_PRIORITY" ]; then
+    CANDIDATES="$PROFILE_INIT_PRIORITY"
 else
     # kaos-init is generated fresh on every start regardless of what the
     # rootfs actually has, so it always exists -- it must come AFTER real
@@ -1537,6 +1615,22 @@ if [ -z "$INIT" ]; then
 fi
 
 log "Selected init: $INIT"
+
+# Mark this rootfs as running in overlay/namespace mode, not switch_root cold
+# boot. The rootfs at $CHROOT is the *same* tree both boot paths use, and the
+# cold-boot-only systemd units (system_root.mount, system.mount, vendor.mount,
+# vendor-firmware_mnt.mount, system_ext.mount, product.mount, odm.mount,
+# kaos-droid-hal-init.service) are installed rootfs-wide (WantedBy=local-fs.
+# target/graphical.target), so real systemd here would run them too -- they
+# remount partitions Android already has mounted and exec a second
+# droid-hal-init that fights the real one for the same hwservicemanager/HIDL
+# registrations. Those units gate on ConditionPathExists=!/etc/kaos-overlay-
+# active, so it must exist before $INIT (real systemd) starts evaluating unit
+# conditions. kaos.init (the switch_root cold-boot script, never run for
+# overlay mode) removes this same file at the very start of its own run, so a
+# stale marker from a previous overlay session can never mask cold boot's own
+# units.
+touch /etc/kaos-overlay-active 2>/dev/null
 
 # --- Phase 6: Exec init ---
 exec $INIT 2>> $LOG
@@ -1717,6 +1811,9 @@ stop_namespace() {
 show_status() {
     if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
         echo "Active (PID $(cat $PID_FILE))"
+    elif _ns=$(running_namespace); then
+        _ns_distro=${_ns%% *}; _ns_pid=${_ns##* }
+        echo "Inactive (but '$_ns_distro' namespace is running, PID $_ns_pid)"
     else
         [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
         echo "Inactive"
