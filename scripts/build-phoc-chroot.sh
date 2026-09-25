@@ -72,7 +72,19 @@ apt-get build-dep -y phoc
 git clone --depth 1 --branch group/next/phosh-0.47 \
     https://github.com/droidian/phoc.git /usr/src/phoc-droidian
 cd /usr/src/phoc-droidian
-meson setup build --prefix=/usr --buildtype=release -Dxwayland=disabled
+# embed-wlroots defaults to 'auto' (subprojects/wlroots.wrap, pinned to
+# mainline wlroots 0.18.2 -- NOT our fork, no hwcomposer backend at all).
+# With network access meson successfully fetches and builds that
+# subproject instead of using our own already-installed
+# wlroots-hwcomposer, then fails anyway: meson.build:81's
+# cc.has_header(dependencies: wlroots) requires an *external* dependency
+# object, which the embedded-subproject path doesn't provide ("Dependency
+# must be an external dependency"). Confirmed live 2026-09-25 on the Mac
+# build. Force the system/pkg-config path (PKG_CONFIG_PATH above already
+# points at our own wlroots-hwcomposer's .pc file) so this can never
+# silently link the wrong wlroots even when the subproject fetch would
+# have succeeded.
+meson setup build --prefix=/usr --buildtype=release -Dxwayland=disabled -Dembed-wlroots=disabled
 ninja -C build
 ninja -C build install
 cd /usr/src
