@@ -8,6 +8,6 @@
 # packages, installed by build-rootfs.sh before this script runs).
 set -e
 cd /usr/src/libglibutil
-make release pkgconfig
+make -j"$(nproc)" release pkgconfig
 make install-dev
 ldconfig

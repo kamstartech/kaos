@@ -89,7 +89,7 @@ cd "$BUILD_DIR"
 # to /usr elsewhere in this build (gralloc/hwc2/etc. from earlier scripts),
 # unaffected by this directory's contents.
 for d in include common properties hardware ui gralloc libsync platforms egl glesv1 glesv2 hwc2; do
-    make -C "$d"
+    make -j"$(nproc)" -C "$d"
     make -C "$d" install
 done
 ldconfig

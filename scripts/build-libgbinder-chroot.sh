@@ -11,6 +11,6 @@
 # immediately before this runs) and libdroid/wlroots-hwcomposer.
 set -e
 cd /usr/src/libgbinder
-make release pkgconfig
+make -j"$(nproc)" release pkgconfig
 make install-dev
 ldconfig
