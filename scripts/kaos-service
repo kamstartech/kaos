@@ -358,7 +358,23 @@ Environment=PHOC_DEBUG=auto-maximize
 Environment=WLR_RENDERER=gles2
 Environment=WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
 Environment=MESA_LOADER_DRIVER_OVERRIDE=zink
-Environment=LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib:/usr/local/mesa-kgsl/lib/dri
+# /usr/lib/hybris appended (not prepended -- mesa-kgsl's own Mesa/EGL/GLESv2
+# build must still win the search for THOSE libraries, same SONAME
+# collision reasoning as everywhere else libhybris is isolated this way).
+# Confirmed live 2026-09-25: this namespace's phoc build failed outright
+# with "error while loading shared libraries: libsync.so.2: cannot open
+# shared object file" (also libhwc2.so.1, libhybris-common.so.1,
+# libgralloc.so.1, libhybris-hwcomposerwindow.so.1 -- all real deps of
+# /usr/lib/aarch64-linux-gnu/libwlroots.so.12, which is a symlink to OUR
+# own wlroots-hwcomposer build, not Ubuntu's plain apt package -- deploying
+# wlroots-hwcomposer for the cold-boot hwcomposer backend replaced that
+# system-wide symlink, and this namespace's own phoc loads the identical
+# .so file even though it only ever uses the headless/DRM backend, not the
+# android/hwcomposer one). Cold-boot's own phosh.service.d/kaos.conf
+# (kaos.init) already sets LD_LIBRARY_PATH=/usr/lib/hybris for exactly this
+# reason; this namespace path never needed it before because it used to
+# load a plain wlroots build with no hybris dependency at all.
+Environment=LD_LIBRARY_PATH=/usr/local/mesa-kgsl/lib:/usr/local/mesa-kgsl/lib/dri:/usr/lib/hybris
 Environment=MESA_DRIVERS_PATH=/usr/local/mesa-kgsl/lib/dri
 Environment=LIBGL_DRIVERS_PATH=/usr/local/mesa-kgsl/lib/dri
 Environment=GBM_BACKENDS_PATH=/usr/local/mesa-kgsl/lib/gbm
