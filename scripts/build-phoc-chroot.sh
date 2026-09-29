@@ -36,15 +36,31 @@
 #      own wlroots fork apparently added them separately; ours hasn't
 #      picked that up). Not worth chasing for a mobile Wayland-only shell --
 #      X11 app support is a real, known, accepted loss here, not a mistake.
+#
+# 2026-09-28: this script used to also run `apt-get install -y wget git`
+# and `apt-get build-dep -y phoc` itself, right before the git clone
+# below. That silently reinstalled stock libwlroots-dev *after*
+# wlroots-hwcomposer was already in place from the previous build step,
+# clobbering its headers/lib right before phoc-droidian's own build --
+# so it compiled against reverted stock wlroots 0.17.1 instead of the
+# fork, failing with "too many arguments to wlr_output_layout_create"
+# and "no member named 'new_toplevel'" (both real API/struct differences
+# the fork's 6414 extra commits introduced). Fixed by moving both apt
+# calls into build-rootfs.sh, before wlroots-hwcomposer's own install --
+# see the comment there.
 set -e
 
 export PKG_CONFIG_PATH="/usr/lib/hybris/pkgconfig:/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
-# Fresh debootstrap images don't have wget or git by default (confirmed
-# live 2026-09-25 building kali: "wget: not found") -- the live device this
-# was first tested on already had wget installed from earlier ad-hoc work,
-# masking this gap. Both are needed below (pixman tarball, phoc git clone).
-apt-get install -y wget git
+# wget/git and phoc's own build-deps (including stock libwlroots-dev) are
+# installed by build-rootfs.sh itself now, BEFORE wlroots-hwcomposer's
+# build overwrites stock wlroots on disk -- not here. Running `apt-get
+# build-dep -y phoc` from this script used to reinstall stock
+# libwlroots-dev *after* wlroots-hwcomposer was already in place,
+# clobbering the fork's headers/lib right before the meson/ninja build
+# below, which then silently compiled phoc-droidian against the wrong
+# wlroots API. See build-rootfs.sh's own comment where that apt call now
+# lives for the full story.
 
 # Gap 1: newer pixman. dpkg will still think libpixman-1-0 owns the old
 # .so.0 file underneath this -- same acceptable tradeoff wlroots-hwcomposer's
@@ -61,13 +77,12 @@ cd /usr/src
 rm -rf pixman-0.46.4
 
 # Gap 2 + the real fix: Droidian's own phoc, tracking a wlroots fork like
-# ours instead of stock. apt build-dep pulls in gtk3/gnome-desktop/etc (the
-# same runtime deps phosh-core already needed) -- letting it also pull
-# libwlroots-dev is harmless here since we never `apt install phoc` again
-# after this; we only use its OTHER build-deps and build against our own
-# already-installed wlroots-hwcomposer via PKG_CONFIG_PATH regardless of
-# whatever libwlroots-dev apt installed alongside it.
-apt-get build-dep -y phoc
+# ours instead of stock. Its build-deps (gtk3/gnome-desktop/etc, the same
+# runtime deps phosh-core already needed, plus stock libwlroots-dev) were
+# already installed by build-rootfs.sh before wlroots-hwcomposer's own
+# build overwrote it on disk -- see this file's top comment. We only use
+# those OTHER build-deps here and build against our own already-installed
+# wlroots-hwcomposer via PKG_CONFIG_PATH.
 
 git clone --depth 1 --branch group/next/phosh-0.47 \
     https://github.com/droidian/phoc.git /usr/src/phoc-droidian
