@@ -40,8 +40,19 @@ set -e
 # Android 15 headers use Clang nullability annotations (_Nullable/_Nonnull) and
 # __INTRODUCED_IN that GCC does not understand. Force-include a shim that
 # defines them away before any Android header is parsed.
-export CFLAGS="${CFLAGS:+$CFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h"
-export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h"
+#
+# -DHYBRIS_BUILD: data_space.h's ADataSpace and hardware_buffer.h's
+# AHardwareBufferStatus declare their enum with an explicit underlying
+# type ("enum Foo : int32_t { ... }"), C++11/C23 syntax GCC's plain C
+# mode rejects. Both headers already have an #ifdef HYBRIS_BUILD branch
+# using plain "enum Foo { ... }" for exactly this reason (see
+# build-libhybris-chroot.sh's own identical fix/comment) -- this build
+# needs the same define, since render/android/renderer.c transitively
+# includes both via wlr_android_wlegl.h -> system/window.h. Confirmed
+# live 2026-09-30: this meson build hit the identical
+# "expected identifier or '(' before ':' token" libhybris's did.
+export CFLAGS="${CFLAGS:+$CFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h -DHYBRIS_BUILD"
+export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h -DHYBRIS_BUILD"
 
 # libhybris (libgralloc, libhwc2, hwcomposer-egl/hybris-hwcomposerwindow)
 # installs to /usr/lib/hybris now, not the standard system libdir -- see

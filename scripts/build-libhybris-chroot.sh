@@ -69,8 +69,20 @@ find /usr/src/libhybris -type d -name '.libs' -o -type d -name '.deps' \
 # Android 15 headers use Clang nullability annotations (_Nullable/_Nonnull) and
 # __INTRODUCED_IN that GCC does not understand. Force-include a shim that
 # defines them away before any Android header is parsed.
-export CFLAGS="${CFLAGS:+$CFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h"
-export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h"
+#
+# -DHYBRIS_BUILD: some of these headers (data_space.h's ADataSpace,
+# hardware_buffer.h's AHardwareBufferStatus) declare their enum with an
+# explicit underlying type -- "enum Foo : int32_t { ... }" -- which is
+# C++11/C23 syntax GCC's plain C mode rejects ("expected identifier or
+# '(' before ':' token"). data_space.h already has an #ifdef HYBRIS_BUILD
+# branch using plain "enum Foo { ... }" for exactly this reason, added by
+# an earlier pass over these headers -- it was just never getting
+# defined here, so that branch never actually took effect. Confirmed
+# live 2026-09-30 building a Debian rootfs: gralloc.c failed compiling
+# both enums for this reason (hardware_buffer.h's own AHardwareBufferStatus
+# didn't even have the guard yet -- added to match, see that file).
+export CFLAGS="${CFLAGS:+$CFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h -DHYBRIS_BUILD"
+export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-include /usr/src/android-headers/kaos-gcc-compat.h -DHYBRIS_BUILD"
 
 BUILD_DIR=/usr/src/libhybris-build
 mkdir -p "$BUILD_DIR"
