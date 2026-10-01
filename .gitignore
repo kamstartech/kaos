@@ -22,3 +22,6 @@ kaos-term/
 
 # Tool-specific scratch state
 .opencode-tasks/
+
+# build-distro.sh's own build-duration history
+scripts/.build-times.log
